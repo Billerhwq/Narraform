@@ -12,8 +12,13 @@ const analysisRuns = new Map();
 
 function now() { return new Date().toISOString(); }
 function materialError(code, message, status = 400) { const error = new Error(message); error.code = code; error.status = status; return error; }
-function publicItem(item) { const { text, inputText, storagePath, ...safe } = item; return { ...safe, excerpt: text?.slice(0, 160) || null }; }
+function publicItem(item) { const { text, inputText, storagePath, segments, ...safe } = item; return { ...safe, excerpt: text?.slice(0, 160) || null }; }
 function sourceLocator(item, statement, index) {
+  const segment = item.segments?.find((entry) => entry.text.includes(statement));
+  if (segment) {
+    const start = segment.text.indexOf(statement);
+    return { ...segment.locator, start, end: start + statement.length };
+  }
   const start = Math.max(0, item.text.indexOf(statement));
   if (item.type === 'url') return { url: item.url, start, end: start + statement.length };
   return { start, end: start + statement.length, paragraph: index + 1 };
@@ -86,12 +91,14 @@ function detectConflicts(facts) {
 }
 
 function buildAnalysis(set) {
-  const evidence = set.items.flatMap((item) => item.evidence || []);
-  const imageObservations = evidence.filter((item) => item.evidenceClass === 'image_observation');
-  const userClaims = evidence.filter((item) => item.evidenceClass === 'user_claim');
-  const verifiedFacts = evidence.filter((item) => item.evidenceClass === 'verified_fact');
-  const inferences = evidence.filter((item) => item.evidenceClass === 'inference');
-  const factsForConflict = [...verifiedFacts, ...userClaims, ...imageObservations.filter((item) => item.userStatus === 'confirmed')];
+  const evidence = [...set.items.flatMap((item) => item.evidence || []), ...(set.userCorrections || [])];
+  const visibleEvidence = evidence.filter((item) => item.userStatus !== 'ignored' && !item.supersededBy);
+  const imageObservations = visibleEvidence.filter((item) => item.evidenceClass === 'image_observation');
+  const userClaims = visibleEvidence.filter((item) => item.evidenceClass === 'user_claim');
+  const verifiedFacts = visibleEvidence.filter((item) => item.evidenceClass === 'verified_fact');
+  const inferences = visibleEvidence.filter((item) => item.evidenceClass === 'inference');
+  const factsForConflict = [...verifiedFacts, ...userClaims]
+    .filter((item) => item.userStatus !== 'ignored' && !item.supersededBy && item.usableForClaims !== false);
   return {
     status: set.items.some((item) => ['queued', 'processing'].includes(item.status)) ? 'processing' : set.items.some((item) => ['failed', 'partial'].includes(item.status)) ? 'partial' : 'ready',
     imageObservations,
@@ -106,7 +113,7 @@ function buildAnalysis(set) {
 
 export async function createMaterialSet({ instruction = '' } = {}) {
   const createdAt = now();
-  const set = { materialSetId: `matset_${crypto.randomUUID()}`, revision: 1, instruction: instruction.trim(), status: 'ready', items: [], analysis: null, createdAt, updatedAt: createdAt };
+  const set = { materialSetId: `matset_${crypto.randomUUID()}`, revision: 1, instruction: instruction.trim(), status: 'ready', items: [], userCorrections: [], analysis: null, createdAt, updatedAt: createdAt };
   if (set.instruction) {
     const material = createTextMaterial(set.instruction, '创作说明');
     const item = { sourceId: 'instruction', type: 'user_text', name: '创作说明', status: 'ready', text: material.text, characterCount: material.characterCount, evidence: [] };
@@ -166,7 +173,7 @@ async function fileToItem(set, file, visionClient, existing = {}) {
     return item;
   }
   const parsed = await parseUploadedFile(file);
-  const item = { ...existing, sourceId, type: fileType(file), name: parsed.displayName, mimeType: parsed.mimeType, size: file.buffer.length, contentHash: existing.contentHash || contentHash(file.buffer), status: 'ready', text: parsed.text, characterCount: parsed.characterCount, evidence: [] };
+  const item = { ...existing, sourceId, type: fileType(file), name: parsed.displayName, mimeType: parsed.mimeType, size: file.buffer.length, contentHash: existing.contentHash || contentHash(file.buffer), status: 'ready', text: parsed.text, segments: parsed.segments || [], characterCount: parsed.characterCount, evidence: [] };
   item.evidence = textEvidence(item);
   return item;
 }
@@ -415,25 +422,66 @@ export async function updateMaterialFact(materialSetId, factId, patch = {}, base
       target = item.evidence?.find((fact) => fact.factId === factId);
       if (target) break;
     }
+    target ||= set.userCorrections?.find((fact) => fact.factId === factId);
     if (!target) throw materialError('MATERIAL_FACT_NOT_FOUND', '没有找到这条资料信息', 404);
-    if (patch.statement?.trim()) target.statement = patch.statement.trim();
-    if (['confirmed', 'corrected', 'ignored', 'unreviewed'].includes(patch.userStatus)) target.userStatus = patch.userStatus;
-    if (target.evidenceClass === 'image_observation') target.usableForClaims = ['confirmed', 'corrected'].includes(target.userStatus);
+    set.userCorrections ||= [];
+    const requestedStatus = ['confirmed', 'corrected', 'ignored', 'unreviewed'].includes(patch.userStatus) ? patch.userStatus : null;
+    const correctedStatement = patch.statement?.trim();
+    const editingCorrection = target.sourceType === 'user_correction' && Boolean(correctedStatement);
+    const needsDerivedFact = !editingCorrection && (target.evidenceClass === 'image_observation' && ['confirmed', 'corrected'].includes(requestedStatus)
+      || Boolean(correctedStatement && correctedStatement !== target.statement));
+    if (requestedStatus) target.userStatus = requestedStatus;
+    if (editingCorrection) {
+      target.statement = correctedStatement;
+      target.userStatus = 'confirmed';
+      target.usableForClaims = true;
+    }
+    if (requestedStatus === 'ignored') {
+      const derived = set.userCorrections.find((fact) => fact.derivedFrom === target.factId);
+      if (derived) derived.userStatus = 'ignored';
+      target.usableForClaims = false;
+    } else if (needsDerivedFact) {
+      let derived = set.userCorrections.find((fact) => fact.derivedFrom === target.factId);
+      if (!derived) {
+        derived = {
+          factId: `fact_${crypto.randomUUID()}`,
+          statement: correctedStatement || target.statement,
+          evidenceClass: 'verified_fact',
+          sourceType: 'user_correction',
+          sourceId: target.sourceId,
+          locator: { ...(target.locator || {}), derivedFrom: target.factId },
+          confidence: 1,
+          usableForClaims: true,
+          userStatus: 'confirmed',
+          derivedFrom: target.factId,
+        };
+        set.userCorrections.push(derived);
+      } else {
+        derived.statement = correctedStatement || target.statement;
+        derived.userStatus = 'confirmed';
+        derived.usableForClaims = true;
+      }
+      target.derivedFactId = derived.factId;
+      target.usableForClaims = false;
+      if (correctedStatement && correctedStatement !== target.statement) target.supersededBy = derived.factId;
+    }
     set.revision += 1; set.updatedAt = now(); set.analysis = buildAnalysis(set); set.status = set.analysis.status;
     return set;
   }, 'materialSetId');
   return updated ? publicMaterialSet(updated) : null;
 }
 
-export async function resolveMaterialConflicts(materialSetId, resolutions = []) {
+export async function resolveMaterialConflicts(materialSetId, resolutions = [], baseRevision) {
   const updated = await updateEntity('materialSets', materialSetId, (set) => {
+    if (baseRevision !== undefined && Number(baseRevision) !== Number(set.revision)) throw materialError('MATERIAL_REVISION_CONFLICT', '资料已经更新，请刷新后继续', 409);
     for (const resolution of resolutions) {
-      for (const item of set.items) for (const fact of item.evidence || []) {
+      const facts = [...set.items.flatMap((item) => item.evidence || []), ...(set.userCorrections || [])];
+      for (const fact of facts) {
         if (resolution.keepFactId === fact.factId) fact.userStatus = 'confirmed';
         if ((resolution.ignoreFactIds || []).includes(fact.factId)) fact.userStatus = 'ignored';
       }
     }
-    set.revision += 1; set.updatedAt = now(); set.analysis = buildAnalysis(set); return set;
+    set.revision += 1; set.updatedAt = now(); set.analysis = buildAnalysis(set); set.status = set.analysis.status; return set;
   }, 'materialSetId');
   return updated ? publicMaterialSet(updated) : null;
 }
@@ -457,15 +505,15 @@ export async function deleteMaterialSet(materialSetId) {
 
 export function factSetFromMaterialSet(set) {
   const analysis = set.analysis || buildAnalysis(set);
-  const promotedImages = analysis.imageObservations.filter((item) => item.usableForClaims && item.userStatus !== 'ignored').map((item) => ({ ...item, evidenceClass: 'verified_fact', derivedFrom: item.factId }));
-  const usable = [...analysis.verifiedFacts, ...analysis.userClaims, ...promotedImages].filter((item) => item.userStatus !== 'ignored');
+  const usable = [...analysis.verifiedFacts, ...analysis.userClaims]
+    .filter((item) => item.userStatus !== 'ignored' && !item.supersededBy && item.usableForClaims !== false);
   return {
     verifiedFacts: usable,
     facts: usable,
     opinions: [],
     experiences: [],
     unknowns: analysis.unknowns,
-    claimsRequiringConfirmation: analysis.imageObservations.filter((item) => !item.usableForClaims),
+    claimsRequiringConfirmation: analysis.imageObservations.filter((item) => !['confirmed', 'corrected', 'ignored'].includes(item.userStatus)),
     conflicts: analysis.conflicts.filter((item) => item.status === 'unresolved'),
     knownNumbers: [...new Set(usable.flatMap((item) => item.statement.match(/\d+(?:\.\d+)?(?:%|倍|万|元|天|小时|分钟)?/g) || []))],
     sourceMetadata: set.items.map((item) => ({ sourceId: item.sourceId, displayName: item.name, externalizable: false })),

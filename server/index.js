@@ -13,10 +13,11 @@ import { executeContentOperation } from './operation-engine.js';
 import { getPublicOperationSpecs } from './operation-specs.js';
 import { hashContent } from './change-set.js';
 import { getPublicXhsFormatting, normalizeXhsFormattingOverride, resolveXhsFormattingProfile } from './xhs-formatting.js';
+import { createMaterialSet, deleteMaterialItem, deleteMaterialSet, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialAnalysisJob, getMaterialAsset, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, resolveMaterialConflicts, resumePendingMaterialAnalysisJobs, retryMaterialItem, updateMaterialFact } from './material-understanding.js';
 
 const app = express();
 const port = Number(process.env.CONTENTFLOW_API_PORT || 4176);
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024, files: 10 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 20 } });
 
 app.use(express.json({ limit: '2mb' }));
 
@@ -57,16 +58,106 @@ app.post('/api/materials/url', async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+app.post('/api/material-sets', async (request, response, next) => {
+  try { response.status(201).json({ materialSet: await createMaterialSet({ instruction: request.body.instruction || '' }) }); }
+  catch (error) { next(error); }
+});
+
+app.post('/api/material-sets/:id/items', upload.array('files', 20), async (request, response, next) => {
+  try {
+    let items = request.body.items || [];
+    if (typeof items === 'string') {
+      try { items = JSON.parse(items); } catch { items = []; }
+    }
+    if (!Array.isArray(items)) items = [items];
+    response.status(202).json(await queueMaterialSetItems(request.params.id, { files: request.files || [], items }));
+  } catch (error) { next(error); }
+});
+
+app.get('/api/material-analysis-jobs/:id', async (request, response, next) => {
+  try {
+    const job = await getMaterialAnalysisJob(request.params.id);
+    if (!job) return response.status(404).json({ code: 'MATERIAL_ANALYSIS_JOB_NOT_FOUND', error: '没有找到素材分析任务' });
+    response.json({ job });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/material-analysis-jobs/:id/events', async (request, response, next) => {
+  try { response.json(await getMaterialAnalysisEvents(request.params.id, request.query.after)); }
+  catch (error) { next(error); }
+});
+
+app.post('/api/material-sets/:id/items/:sourceId/retry', async (request, response, next) => {
+  try { response.status(202).json(await retryMaterialItem(request.params.id, request.params.sourceId)); }
+  catch (error) { next(error); }
+});
+
+app.delete('/api/material-sets/:id/items/:sourceId', async (request, response, next) => {
+  try { response.json({ materialSet: await deleteMaterialItem(request.params.id, request.params.sourceId) }); }
+  catch (error) { next(error); }
+});
+
+app.get('/api/material-sets/:id/analysis', async (request, response, next) => {
+  try {
+    const materialSet = await getMaterialSet(request.params.id);
+    if (!materialSet) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
+    response.json({ materialSetId: materialSet.materialSetId, revision: materialSet.revision, ...materialSet.analysis });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/material-sets/:id/items/:sourceId/asset', async (request, response, next) => {
+  try {
+    const asset = await getMaterialAsset(request.params.id, request.params.sourceId);
+    if (!asset) return response.status(404).json({ code: 'MATERIAL_ASSET_NOT_FOUND', error: '没有找到这份图片资料' });
+    response.type(asset.mimeType).set('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(asset.name)}`).send(asset.buffer);
+  } catch (error) { next(error); }
+});
+
+app.get('/api/material-sets/:id', async (request, response, next) => {
+  try {
+    const materialSet = await getMaterialSet(request.params.id);
+    if (!materialSet) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
+    response.json({ materialSet });
+  } catch (error) { next(error); }
+});
+
+app.patch('/api/material-sets/:id/facts/:factId', async (request, response, next) => {
+  try {
+    const materialSet = await updateMaterialFact(request.params.id, request.params.factId, request.body, request.body.baseRevision ?? request.get('If-Match'));
+    if (!materialSet) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
+    response.json({ materialSet });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/material-sets/:id/resolve-conflicts', async (request, response, next) => {
+  try {
+    const materialSet = await resolveMaterialConflicts(request.params.id, request.body.resolutions || [], request.body.baseRevision ?? request.get('If-Match'));
+    if (!materialSet) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
+    response.json({ materialSet });
+  } catch (error) { next(error); }
+});
+
+app.delete('/api/material-sets/:id', async (request, response, next) => {
+  try {
+    if (!(await deleteMaterialSet(request.params.id))) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+
 app.post('/api/tasks/understand', async (request, response, next) => {
   try {
     const materials = await getMaterials(request.body.materialIds || []);
+    const materialSet = request.body.materialSetId ? await getMaterialSetInternal(request.body.materialSetId) : null;
+    if (request.body.materialSetId && !materialSet) return response.status(404).json({ code: 'MATERIAL_SET_NOT_FOUND', error: '没有找到这组创作资料' });
     const { taskBrief, factSet } = createTaskBrief({
       instruction: request.body.instruction || '',
       platform: normalizePlatform(request.body.platform),
       platformMode: request.body.platformMode,
       tone: request.body.tone,
       materials,
+      factSet: materialSet ? factSetFromMaterialSet(materialSet) : null,
     });
+    if (materialSet) taskBrief.materialSetId = materialSet.materialSetId;
     await saveTask(taskBrief);
     response.status(201).json({
       status: taskBrief.status,
@@ -316,7 +407,7 @@ function publicError(error) {
 app.use((error, request, response, _next) => {
   const status = error instanceof multer.MulterError ? 400 : error.status || 500;
   const message = error instanceof multer.MulterError
-    ? error.code === 'LIMIT_FILE_SIZE' ? '单个文件不能超过 15 MB' : '文件上传失败，请减少文件数量或重试'
+    ? error.code === 'LIMIT_FILE_SIZE' ? '单个文件不能超过 20 MB' : '文件上传失败，请减少文件数量或重试'
     : publicError(error);
   if (status >= 500 && process.env.NODE_ENV !== 'test') {
     console.error('[Narraform API]', {
@@ -333,7 +424,10 @@ app.use((error, request, response, _next) => {
 
 if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === process.argv[1].toLowerCase()) {
   detectCodexCli().then((codex) => console.log(`Codex CLI ${codex.status}${codex.version ? ` (${codex.version})` : ''}`));
-  app.listen(port, '127.0.0.1', () => console.log(`Narraform API http://127.0.0.1:${port}`));
+  app.listen(port, '127.0.0.1', async () => {
+    const resumed = await resumePendingMaterialAnalysisJobs().catch((error) => { console.error('[Narraform material queue]', error); return 0; });
+    console.log(`Narraform API http://127.0.0.1:${port}${resumed ? ` · resumed ${resumed} background job(s)` : ''}`);
+  });
 }
 
 export default app;

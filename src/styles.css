@@ -106,6 +106,14 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
 .material-block-heading { min-height: 42px; margin-top: 15px; display: flex; align-items: center; justify-content: space-between; }
 .material-block-heading h2 { display: inline; margin: 0 8px 0 0; font-size: 14px; }
 .material-block-heading > div > span { color: #929aa6; font-size: 10px; }
+.material-conflicts { margin-top: 14px; padding: 0 12px 12px; border: 1px solid #f1d7a6; border-radius: 7px; background: #fffdf7; }
+.material-conflict-row + .material-conflict-row { margin-top: 12px; padding-top: 12px; border-top: 1px solid #f1e3c7; }
+.material-conflict-row > strong { display: block; margin-bottom: 7px; font-size: 11px; }
+.material-conflict-row > div { display: grid; gap: 6px; }
+.material-conflict-row button { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 10px; border: 1px solid #e5e8ed; border-radius: 6px; background: #fff; color: #303846; text-align: left; cursor: pointer; }
+.material-conflict-row button:hover { border-color: #8bb2ff; background: #f6f9ff; }
+.material-conflict-row button span { min-width: 0; font-size: 10px; line-height: 1.45; }
+.material-conflict-row button small { flex: none; color: var(--brand); font-size: 9px; }
 .trace-status { display: inline-flex; align-items: center; gap: 5px; color: var(--success); font-size: 10px; }
 .material-source-list { overflow: hidden; border: 1px solid #dfe4eb; border-radius: 7px; background: #fff; }
 .material-source-row { position: relative; display: grid; grid-template-columns: minmax(0,1fr) auto; border-bottom: 1px solid #edf0f3; background: #fff; }
@@ -152,6 +160,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
 .selected-evidence-detail > span { color: var(--brand); font-size: 8px; font-weight: 700; text-transform: uppercase; }
 .selected-evidence-detail h3 { margin: 5px 0 7px; font-size: 13px; line-height: 1.45; }
 .selected-evidence-detail p { margin: 0; color: #667180; font-size: 10px; line-height: 1.6; }
+.evidence-locator { margin-top: 10px; display: flex; align-items: center; gap: 6px; color: #5f6f84; font-size: 9px; }
 .confidence-line { margin: 13px 0 5px; display: flex; justify-content: space-between; color: #88919e; font-size: 9px; }
 .evidence-actions { margin-top: 14px; display: flex; justify-content: flex-end; gap: 7px; }
 .preview-guidance, .unknown-facts { margin-top: 16px; padding: 10px; display: flex; gap: 7px; border-radius: 6px; background: #f2f4f7; color: #778292; font-size: 9px; line-height: 1.55; }

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { addMaterialSetItems, createMaterialSet, deleteMaterialItem, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, retryMaterialItem, updateMaterialFact, waitForMaterialAnalysis } from '../server/material-understanding.js';
+import { addMaterialSetItems, createMaterialSet, deleteMaterialItem, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, resolveMaterialConflicts, retryMaterialItem, updateMaterialFact, waitForMaterialAnalysis } from '../server/material-understanding.js';
 import { resetRoadmapStore } from '../server/roadmap-store.js';
 
 test.beforeEach(async () => resetRoadmapStore());
@@ -47,9 +47,51 @@ test('PR-02 图片观察只有经用户确认后才能进入生成 FactSet', asy
   assert.equal(factSet.verifiedFacts.some((fact) => fact.statement === observation.statement), false);
 
   const confirmed = await updateMaterialFact(created.materialSetId, observation.factId, { userStatus: 'confirmed' }, added.materialSet.revision);
-  assert.equal(confirmed.analysis.imageObservations[0].usableForClaims, true);
+  assert.equal(confirmed.analysis.imageObservations[0].usableForClaims, false);
+  const derived = confirmed.analysis.verifiedFacts.find((fact) => fact.derivedFrom === observation.factId);
+  assert.ok(derived);
+  assert.equal(derived.sourceType, 'user_correction');
+  assert.notEqual(derived.factId, observation.factId);
   factSet = factSetFromMaterialSet(await getMaterialSetInternal(created.materialSetId));
-  assert.equal(factSet.verifiedFacts.some((fact) => fact.statement === observation.statement), true);
+  assert.equal(factSet.verifiedFacts.some((fact) => fact.factId === derived.factId && fact.statement === observation.statement), true);
+});
+
+test('PR-02 用户修正保留原证据，并以派生事实覆盖创作上下文', async () => {
+  const created = await createMaterialSet();
+  const added = await addMaterialSetItems(created.materialSetId, {
+    items: [{ type: 'user_text', text: 'CodeLoop 支持所有编程语言。' }],
+  });
+  const original = added.materialSet.analysis.userClaims[0];
+  const corrected = await updateMaterialFact(created.materialSetId, original.factId, {
+    statement: 'CodeLoop 可以读取用户授权的代码仓库。',
+    userStatus: 'corrected',
+  }, added.materialSet.revision);
+  const internal = await getMaterialSetInternal(created.materialSetId);
+  const storedOriginal = internal.items.flatMap((item) => item.evidence).find((fact) => fact.factId === original.factId);
+  assert.equal(storedOriginal.statement, original.statement);
+  assert.ok(storedOriginal.supersededBy);
+  assert.equal(corrected.analysis.userClaims.some((fact) => fact.factId === original.factId), false);
+  const factSet = factSetFromMaterialSet(internal);
+  assert.deepEqual(factSet.verifiedFacts.map((fact) => fact.statement), ['CodeLoop 可以读取用户授权的代码仓库。']);
+});
+
+test('PR-02 文档事实保留段落定位，冲突由用户选择后消解', async () => {
+  const created = await createMaterialSet();
+  const added = await addMaterialSetItems(created.materialSetId, {
+    files: [{ originalname: '产品说明.md', mimetype: 'text/markdown', size: 80, buffer: Buffer.from('# 产品说明\n\nCodeLoop 支持 Python。\n\nCodeLoop 支持 Java。') }],
+  });
+  const python = added.materialSet.analysis.verifiedFacts.find((fact) => /Python/.test(fact.statement));
+  assert.equal(python.locator.paragraph, 2);
+  assert.equal(added.materialSet.analysis.conflicts.length, 1);
+  const conflict = added.materialSet.analysis.conflicts[0];
+  const resolved = await resolveMaterialConflicts(created.materialSetId, [{
+    keepFactId: python.factId,
+    ignoreFactIds: conflict.factIds.filter((factId) => factId !== python.factId),
+  }], added.materialSet.revision);
+  assert.equal(resolved.analysis.conflicts.length, 0);
+  const factSet = factSetFromMaterialSet(await getMaterialSetInternal(created.materialSetId));
+  assert.equal(factSet.verifiedFacts.some((fact) => /Python/.test(fact.statement)), true);
+  assert.equal(factSet.verifiedFacts.some((fact) => /Java/.test(fact.statement)), false);
 });
 
 test('PR-02 未配置视觉模型时诚实降级，不根据文件名伪造观察', async () => {

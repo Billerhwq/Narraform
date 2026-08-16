@@ -3,7 +3,7 @@ import JSZip from 'jszip';
 import { Alert, Button, Checkbox, Empty, Input, Message, Modal, Progress, Radio, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
 import {
   IconCalendar, IconCheck, IconCheckCircleFill, IconClose, IconCopy, IconExperiment, IconFile,
-  IconDelete, IconFolder, IconImage, IconInfoCircle, IconLink, IconPlus, IconRefresh, IconRight,
+  IconDelete, IconEdit, IconFolder, IconImage, IconInfoCircle, IconLink, IconPlus, IconRefresh, IconRight,
   IconSend, IconUpload,
 } from '@arco-design/web-react/icon';
 
@@ -44,6 +44,8 @@ export function MaterialsWorkspace({ materialSetId, onMaterialSetChange, onUseFo
   const [urlOpen, setUrlOpen] = useState(false);
   const [text, setText] = useState('');
   const [url, setUrl] = useState('');
+  const [correctionOpen, setCorrectionOpen] = useState(false);
+  const [correctionDraft, setCorrectionDraft] = useState('');
   const [pendingJobs, setPendingJobs] = useState([]);
   const [selectedSourceId, setSelectedSourceId] = useState('');
   const fileRef = useRef(null);
@@ -134,6 +136,24 @@ export function MaterialsWorkspace({ materialSetId, onMaterialSetChange, onUseFo
     } catch (error) { Message.error(error.message); }
   };
 
+  const correctFact = async () => {
+    if (!selectedFact || !correctionDraft.trim()) return;
+    await updateFact(selectedFact, { statement: correctionDraft.trim(), userStatus: 'corrected' });
+    setCorrectionOpen(false);
+  };
+
+  const resolveConflict = async (conflict, keepFactId) => {
+    try {
+      const data = await request(`/api/material-sets/${materialSet.materialSetId}/resolve-conflicts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'If-Match': String(materialSet.revision) },
+        body: JSON.stringify({ baseRevision: materialSet.revision, resolutions: [{ keepFactId, ignoreFactIds: conflict.factIds.filter((id) => id !== keepFactId) }] }),
+      });
+      setMaterialSet(data.materialSet); setSelectedFact(null);
+      Message.success('冲突已按你选择的信息处理');
+    } catch (error) { Message.error(error.message); }
+  };
+
   const retryItem = async (sourceId) => {
     try {
       const data = await request(`/api/material-sets/${materialSet.materialSetId}/items/${sourceId}/retry`, { method: 'POST' });
@@ -151,6 +171,7 @@ export function MaterialsWorkspace({ materialSetId, onMaterialSetChange, onUseFo
   };
 
   const analysis = materialSet?.analysis || { verifiedFacts: [], userClaims: [], imageObservations: [], unknowns: [], sourceSummaries: [] };
+  const allFacts = [...analysis.userClaims, ...analysis.verifiedFacts, ...analysis.imageObservations];
   const selectedSource = selectedFact ? materialSet.items.find((item) => item.sourceId === selectedFact.sourceId) : materialSet?.items.find((item) => item.sourceId === selectedSourceId) || materialSet?.items.find((item) => item.type === 'image') || materialSet?.items[0];
   if (loading) return <div className="roadmap-loading"><Spin /><span>正在打开创作资料</span></div>;
 
@@ -169,18 +190,20 @@ export function MaterialsWorkspace({ materialSetId, onMaterialSetChange, onUseFo
           <EvidenceList title="可用事实" tone="confirmed" items={[...analysis.userClaims, ...analysis.verifiedFacts]} selectedFactId={selectedFact?.factId} onSelect={setSelectedFact} emptyText="添加一句产品介绍即可开始" />
           <EvidenceList title="图片观察" tone="observed" items={analysis.imageObservations} selectedFactId={selectedFact?.factId} onSelect={setSelectedFact} emptyText={materialSet?.items.some((item) => item.type === 'image') ? '图片没有可用观察，检查视觉模型配置' : '上传产品截图后在这里核对'} />
         </div>
+        {!!analysis.conflicts?.length && <section className="material-conflicts"><div className="material-block-heading"><div><h2>信息冲突</h2><span>选择本次创作应使用的说法</span></div><Tag color="orange">{analysis.conflicts.length} 项待处理</Tag></div>{analysis.conflicts.map((conflict) => <div className="material-conflict-row" key={conflict.conflictId}><strong>{conflict.subject}</strong><div>{conflict.factIds.map((factId) => { const fact = allFacts.find((item) => item.factId === factId); return fact ? <button key={factId} type="button" onClick={() => resolveConflict(conflict, factId)}><span>{fact.statement}</span><small>使用这条</small></button> : null; })}</div></div>)}</section>}
       </main>
       <aside className="evidence-preview">
         {selectedSource ? <>
           <div className="preview-source-head"><span className={`source-glyph ${selectedSource.type}`}>{sourceIcon(selectedSource.type)}</span><div><strong>{selectedSource.name}</strong><small>{selectedSource.type === 'image' ? `${selectedSource.width || '?'} × ${selectedSource.height || '?'} · ${selectedSource.analysisStatus === 'analysis_unavailable' ? '视觉分析未配置' : '图片来源'}` : '用户提供的资料'}</small></div></div>
           {selectedSource.type === 'image' ? <div className="actual-image-preview"><img src={`/api/material-sets/${materialSet.materialSetId}/items/${selectedSource.sourceId}/asset`} alt={selectedSource.name} />{selectedFact?.locator?.x !== undefined && selectedSource.width ? <i style={{ left: `${selectedFact.locator.x / selectedSource.width * 100}%`, top: `${selectedFact.locator.y / selectedSource.height * 100}%`, width: `${selectedFact.locator.width / selectedSource.width * 100}%`, height: `${selectedFact.locator.height / selectedSource.height * 100}%` }} /> : null}</div> : <div className="text-source-preview">{selectedSource.excerpt || '这项资料没有可显示的文字摘要。'}</div>}
-          {selectedFact ? <div className="selected-evidence-detail"><span>当前信息</span><h3>{selectedFact.statement}</h3><p>{selectedFact.evidenceClass === 'image_observation' ? '这是从界面中读到的观察。确认后，它才会成为文案可使用的产品事实。' : '这条信息来自用户明确提供的资料，可以用于内容生成。'}</p>{selectedFact.confidence !== undefined && <><div className="confidence-line"><span>提取可信度</span><b>{Math.round(selectedFact.confidence * 100)}%</b></div><Progress percent={Math.round(selectedFact.confidence * 100)} showText={false} size="small" /></>}<div className="evidence-actions"><Button icon={<IconClose />} onClick={() => updateFact(selectedFact, { userStatus: 'ignored' })}>忽略</Button>{selectedFact.evidenceClass === 'image_observation' && <Button type="primary" icon={<IconCheck />} onClick={() => updateFact(selectedFact, { userStatus: 'confirmed' })}>确认事实</Button>}</div></div> : <div className="preview-guidance"><IconInfoCircle /><span>选择一条信息，可以查看它来自哪里以及是否能够用于文案。</span></div>}
+          {selectedFact ? <div className="selected-evidence-detail"><span>当前信息</span><h3>{selectedFact.statement}</h3><p>{selectedFact.evidenceClass === 'image_observation' ? '这是从界面中读到的观察。确认后，系统会另存一条可用事实，不会篡改原观察。' : selectedFact.sourceType === 'user_correction' ? '这是你修正后的说法，优先于原资料用于本次创作。' : '这条信息来自用户明确提供的资料，可以用于内容生成。'}</p>{selectedFact.locator && <div className="evidence-locator"><IconLink /><span>{selectedFact.locator.page ? `第 ${selectedFact.locator.page} 页` : selectedFact.locator.paragraph ? `第 ${selectedFact.locator.paragraph} 段` : selectedFact.locator.x !== undefined ? '图片标记区域' : '原文位置'}{selectedFact.locator.heading ? ` · ${selectedFact.locator.heading}` : ''}</span></div>}{selectedFact.confidence !== undefined && <><div className="confidence-line"><span>提取可信度</span><b>{Math.round(selectedFact.confidence * 100)}%</b></div><Progress percent={Math.round(selectedFact.confidence * 100)} showText={false} size="small" /></>}<div className="evidence-actions"><Button icon={<IconClose />} onClick={() => updateFact(selectedFact, { userStatus: 'ignored' })}>忽略</Button><Button icon={<IconEdit />} onClick={() => { setCorrectionDraft(selectedFact.statement); setCorrectionOpen(true); }}>修正</Button>{selectedFact.evidenceClass === 'image_observation' && selectedFact.userStatus !== 'confirmed' && <Button type="primary" icon={<IconCheck />} onClick={() => updateFact(selectedFact, { userStatus: 'confirmed' })}>确认事实</Button>}</div></div> : <div className="preview-guidance"><IconInfoCircle /><span>选择一条信息，可以查看它来自哪里以及是否能够用于文案。</span></div>}
           {!!analysis.unknowns.length && <div className="unknown-facts"><IconInfoCircle /><div><strong>仍然未知</strong>{analysis.unknowns.map((item) => <span key={String(item)}>{typeof item === 'string' ? item : item.statement}</span>)}</div></div>}
         </> : <Empty description="选择资料查看来源" />}
       </aside>
     </div>
     <Modal title="粘贴产品说明或创作要求" visible={textOpen} onCancel={() => setTextOpen(false)} onOk={addText} okButtonProps={{ loading: adding, disabled: !text.trim() }}><Input.TextArea value={text} onChange={setText} autoSize={{ minRows: 6, maxRows: 12 }} placeholder="例如：CodeLoop 可以读取授权代码仓库，把目标拆成计划，修改代码并运行项目测试。" /></Modal>
     <Modal title="添加你允许读取的网页" visible={urlOpen} onCancel={() => setUrlOpen(false)} onOk={addUrl} okText="读取网页" okButtonProps={{ loading: adding, disabled: !url.trim() }}><Alert type="info" content="Narraform 只读取你在这里明确提交的网页，不会自行搜索或访问其他链接。" style={{ marginBottom: 12 }} /><Input value={url} onChange={setUrl} placeholder="https://example.com/product" /></Modal>
+    <Modal title="修正这条信息" visible={correctionOpen} onCancel={() => setCorrectionOpen(false)} onOk={correctFact} okText="使用修正内容" okButtonProps={{ disabled: !correctionDraft.trim() }}><Alert type="info" content="原始资料会保留。你修正的内容会作为更高优先级的事实进入创作。" style={{ marginBottom: 12 }} /><Input.TextArea value={correctionDraft} onChange={setCorrectionDraft} autoSize={{ minRows: 4, maxRows: 8 }} /></Modal>
   </section>;
 }
 
