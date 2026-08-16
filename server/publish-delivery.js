@@ -10,6 +10,7 @@ import { runAdapterOperation } from './adapter-runtime.js';
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'zhihu', 'wechat']);
 const PLATFORM_LABELS = { xiaohongshu: '小红书', zhihu: '知乎', wechat: '微信公众号' };
 const deliveryRuns = new Map();
+const deliveryControllers = new Map();
 function now() { return new Date().toISOString(); }
 function deliveryError(code, message, status = 400) { const error = new Error(message); error.code = code; error.status = status; return error; }
 function idempotencyKey(pkg) { return crypto.createHash('sha256').update(`${pkg.packageId}:${pkg.platform}:${pkg.target}`).digest('hex'); }
@@ -140,10 +141,15 @@ function adapterCapabilities() {
 
 export function createSandboxDraftAdapter(directory = path.resolve('.test-data', 'platform-drafts')) {
   return {
-    capabilities: async () => ({ draft: true, directPublish: false, verifyDraft: true, requiresSession: false, adapterVersion: 'sandbox-1.0.0' }),
+    capabilities: async () => ({ draft: true, directPublish: false, verifyDraft: true, requiresSession: false, resumableAssets: true, adapterVersion: 'sandbox-1.1.0' }),
     checkSession: async () => ({ status: 'ready' }),
     startLogin: async () => ({ status: 'ready', message: '沙箱模式不需要登录' }),
-    createDraft: async (pkg, key) => {
+    uploadAsset: async (_pkg, asset, key, { signal } = {}) => {
+      if (signal?.aborted) throw Object.assign(new Error('发布任务已取消'), { code: 'DELIVERY_CANCELLED', status: 499 });
+      return { remoteAssetId: `${key}:${asset.assetId}`, assetId: asset.assetId };
+    },
+    createDraft: async (pkg, key, { signal } = {}) => {
+      if (signal?.aborted) throw Object.assign(new Error('发布任务已取消'), { code: 'DELIVERY_CANCELLED', status: 499 });
       await fs.mkdir(directory, { recursive: true });
       const existing = (await fs.readdir(directory)).find((file) => file.startsWith(`${key}.`));
       if (existing) return { remoteDraftId: path.basename(existing, '.json'), path: path.join(directory, existing), idempotentReplay: true };
@@ -163,18 +169,21 @@ function webhookAdapter() {
   const endpoint = process.env.NARRAFORM_DELIVERY_ADAPTER_URL;
   const key = process.env.NARRAFORM_DELIVERY_ADAPTER_KEY;
   if (!endpoint) return null;
-  const call = async (action, payload) => {
-    const response = await fetch(`${endpoint.replace(/\/$/, '')}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(payload), signal: AbortSignal.timeout(120_000) });
+  const call = async (action, payload, signal) => {
+    const timeout = AbortSignal.timeout(120_000);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const response = await fetch(`${endpoint.replace(/\/$/, '')}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) }, body: JSON.stringify(payload), signal: combinedSignal });
     if (!response.ok) throw deliveryError('DELIVERY_ADAPTER_FAILED', `发布连接器返回 ${response.status}`, 502);
     return response.json();
   };
   return {
     capabilities: () => call('capabilities', {}),
-    checkSession: () => call('session', {}),
-    startLogin: (platform) => call('login', { platform }),
-    createDraft: (pkg, keyValue) => call('drafts', { package: pkg, idempotencyKey: keyValue }),
-    publish: (pkg, keyValue) => call('publish', { package: pkg, idempotencyKey: keyValue }),
-    verify: (result) => call('verify', { result }),
+    checkSession: ({ signal } = {}) => call('session', {}, signal),
+    startLogin: (platform, { signal } = {}) => call('login', { platform }, signal),
+    uploadAsset: (pkg, asset, keyValue, { signal } = {}) => call('assets', { packageId: pkg.packageId, platform: pkg.platform, asset, idempotencyKey: `${keyValue}:${asset.assetId}` }, signal),
+    createDraft: (pkg, keyValue, context = {}) => call('drafts', { package: pkg, idempotencyKey: keyValue, checkpoint: context.checkpoint }, context.signal),
+    publish: (pkg, keyValue, context = {}) => call('publish', { package: pkg, idempotencyKey: keyValue, checkpoint: context.checkpoint }, context.signal),
+    verify: (result, pkg, { signal } = {}) => call('verify', { result, package: pkg }, signal),
   };
 }
 
@@ -199,7 +208,7 @@ export async function startPlatformLogin(platform) {
 }
 
 function aggregateJobStatus(items) {
-  if (items.some((item) => item.status === 'submitting' || item.status === 'verifying')) return 'running';
+  if (items.some((item) => ['uploading', 'submitting', 'verifying'].includes(item.status))) return 'running';
   if (items.some((item) => item.status === 'waiting_session')) return 'waiting_session';
   if (items.every((item) => item.status === 'delivered')) return 'delivered';
   if (items.some((item) => item.status === 'uncertain')) return 'uncertain';
@@ -213,7 +222,7 @@ export async function createDeliveryJob(packageIds, { adapterResolver = defaultA
   for (const packageId of [...new Set(packageIds)]) {
     const pkg = await getPublishPackage(packageId);
     if (!pkg) throw deliveryError('PUBLISH_PACKAGE_NOT_FOUND', '没有找到发布包', 404);
-    const item = { packageId, platform: pkg.platform, status: 'queued', preflight: null, attempts: 0, receiptId: null };
+    const item = { packageId, platform: pkg.platform, status: 'queued', preflight: null, attempts: 0, receiptId: null, checkpoint: { uploadedAssets: {} } };
     job.items.push(item);
   }
   await putEntity('deliveryJobs', job, 'jobId');
@@ -221,16 +230,27 @@ export async function createDeliveryJob(packageIds, { adapterResolver = defaultA
   return job;
 }
 
-async function deliverItem(job, item, adapterResolver) {
+async function assertDeliveryActive(jobId, signal) {
+  const latest = await getEntity('deliveryJobs', jobId, 'jobId');
+  if (signal?.aborted || latest?.status === 'cancelled') throw deliveryError('DELIVERY_CANCELLED', '发布任务已取消', 499);
+  return latest;
+}
+
+async function deliverItem(job, item, adapterResolver, signal) {
   const pkg = await getPublishPackage(item.packageId);
   if (!pkg) { item.status = 'failed'; item.errorCode = 'PUBLISH_PACKAGE_NOT_FOUND'; return item; }
   const adapter = typeof adapterResolver === 'function' ? await adapterResolver(pkg.platform) : adapterResolver;
   let capabilities;
   try {
     capabilities = adapter
-      ? await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'capabilities', execute: () => adapter.capabilities() })
+      ? await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'capabilities', execute: () => adapter.capabilities({ signal }) })
       : { draft: false, directPublish: false, verifyDraft: false, requiresSession: true };
   } catch (error) {
+    if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
+      item.status = 'cancelled'; item.errorCode = 'DELIVERY_CANCELLED'; item.userMessage = '发布任务已取消';
+      job.events.push({ type: 'delivery.cancelled', platform: pkg.platform, at: now() });
+      return item;
+    }
     item.status = 'failed'; item.errorCode = error.code || 'ADAPTER_CAPABILITIES_FAILED'; item.userMessage = '平台连接器暂时不可用，可以导出内容包或稍后重试。';
     job.events.push({ type: 'delivery.failed', platform: pkg.platform, code: item.errorCode, at: now() });
     return item;
@@ -251,30 +271,61 @@ async function deliverItem(job, item, adapterResolver) {
   item.adapterVersion = adapterVersion;
   let session;
   try {
-    session = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'check_session', adapterVersion, execute: () => adapter.checkSession() });
+    await assertDeliveryActive(job.jobId, signal);
+    session = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'check_session', adapterVersion, execute: () => adapter.checkSession({ signal }) });
   } catch (error) {
+    if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
+      item.status = 'cancelled'; item.errorCode = 'DELIVERY_CANCELLED'; item.userMessage = '发布任务已取消';
+      job.events.push({ type: 'delivery.cancelled', platform: pkg.platform, at: now() });
+      return item;
+    }
     item.status = 'failed'; item.errorCode = error.code || 'ADAPTER_SESSION_FAILED'; item.userMessage = '暂时无法确认平台登录状态，可以稍后重试。';
     job.events.push({ type: 'delivery.failed', platform: pkg.platform, code: item.errorCode, at: now() });
     return item;
   }
   if (session.status !== 'ready') { item.status = 'waiting_session'; item.session = session; return item; }
-  item.attempts += 1; item.status = 'submitting'; job.events.push({ type: 'delivery.submitting', platform: pkg.platform, at: now() });
-  job.updatedAt = now();
-  await putEntity('deliveryJobs', job, 'jobId');
   try {
+    item.checkpoint ||= { uploadedAssets: {} };
+    item.checkpoint.uploadedAssets ||= {};
+    if (capabilities.resumableAssets && typeof adapter.uploadAsset === 'function' && pkg.assets.length) {
+      item.status = 'uploading'; job.updatedAt = now();
+      await putEntity('deliveryJobs', job, 'jobId');
+      for (const asset of [...pkg.assets].sort((a, b) => a.order - b.order)) {
+        if (item.checkpoint.uploadedAssets[asset.assetId]) continue;
+        await assertDeliveryActive(job.jobId, signal);
+        const uploaded = await runAdapterOperation({
+          adapterKey: `delivery:${pkg.platform}`,
+          action: 'upload_asset',
+          adapterVersion,
+          operationId: `${job.jobId}:${asset.assetId}`,
+          execute: () => adapter.uploadAsset(pkg, asset, idempotencyKey(pkg), { signal, checkpoint: item.checkpoint }),
+        });
+        item.checkpoint.uploadedAssets[asset.assetId] = uploaded;
+        job.events.push({ type: 'delivery.asset_uploaded', platform: pkg.platform, assetId: asset.assetId, at: now() });
+        job.updatedAt = now();
+        await putEntity('deliveryJobs', job, 'jobId');
+      }
+    }
+    await assertDeliveryActive(job.jobId, signal);
+    item.attempts += 1; item.status = 'submitting'; job.events.push({ type: 'delivery.submitting', platform: pkg.platform, at: now() });
+    job.updatedAt = now();
+    await putEntity('deliveryJobs', job, 'jobId');
+    const packageForAdapter = { ...pkg, assets: pkg.assets.map((asset) => ({ ...asset, remoteAsset: item.checkpoint.uploadedAssets[asset.assetId] || null })) };
     const submitted = await runAdapterOperation({
       adapterKey: `delivery:${pkg.platform}`,
       action: pkg.target === 'published' ? 'publish' : 'create_draft',
       adapterVersion,
       operationId: job.jobId,
       execute: () => pkg.target === 'published'
-        ? adapter.publish(pkg, idempotencyKey(pkg))
-        : adapter.createDraft(pkg, idempotencyKey(pkg)),
+        ? adapter.publish(packageForAdapter, idempotencyKey(pkg), { signal, checkpoint: item.checkpoint })
+        : adapter.createDraft(packageForAdapter, idempotencyKey(pkg), { signal, checkpoint: item.checkpoint }),
     });
+    await assertDeliveryActive(job.jobId, signal);
     item.status = 'verifying';
     job.updatedAt = now();
     await putEntity('deliveryJobs', job, 'jobId');
-    const verification = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'verify', adapterVersion, operationId: job.jobId, execute: () => adapter.verify(submitted, pkg) });
+    const verification = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'verify', adapterVersion, operationId: job.jobId, execute: () => adapter.verify(submitted, pkg, { signal }) });
+    await assertDeliveryActive(job.jobId, signal);
     const receipt = {
       receiptId: `rcpt_${crypto.randomUUID()}`,
       jobId: job.jobId,
@@ -296,19 +347,24 @@ async function deliverItem(job, item, adapterResolver) {
     item.receiptId = receipt.receiptId; item.status = receipt.status;
     job.events.push({ type: verification.verified ? 'delivery.delivered' : 'delivery.uncertain', platform: pkg.platform, receiptId: receipt.receiptId, at: now() });
   } catch (error) {
-    item.status = 'failed'; item.errorCode = error.code || 'DELIVERY_FAILED'; item.userMessage = error.message;
-    job.events.push({ type: 'delivery.failed', platform: pkg.platform, code: item.errorCode, at: now() });
+    if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
+      item.status = 'cancelled'; item.errorCode = 'DELIVERY_CANCELLED'; item.userMessage = '发布任务已取消';
+      job.events.push({ type: 'delivery.cancelled', platform: pkg.platform, at: now() });
+    } else {
+      item.status = 'failed'; item.errorCode = error.code || 'DELIVERY_FAILED'; item.userMessage = error.message;
+      job.events.push({ type: 'delivery.failed', platform: pkg.platform, code: item.errorCode, at: now() });
+    }
   }
   return item;
 }
 
-export async function runDeliveryJob(jobId, { adapterResolver = defaultAdapter } = {}) {
+export async function runDeliveryJob(jobId, { adapterResolver = defaultAdapter, signal } = {}) {
   let job = await getEntity('deliveryJobs', jobId, 'jobId');
   if (!job) throw deliveryError('DELIVERY_JOB_NOT_FOUND', '没有找到发布任务', 404);
   if (job.status === 'cancelled') return job;
   job.status = 'running'; job.updatedAt = now();
   job.events.push({ type: 'delivery.started', at: now() });
-  for (const item of job.items) if (['submitting', 'verifying'].includes(item.status)) item.status = 'queued';
+  for (const item of job.items) if (['uploading', 'submitting', 'verifying'].includes(item.status)) item.status = 'queued';
   await putEntity('deliveryJobs', job, 'jobId');
   for (const item of job.items) {
     const latest = await getEntity('deliveryJobs', jobId, 'jobId');
@@ -316,7 +372,9 @@ export async function runDeliveryJob(jobId, { adapterResolver = defaultAdapter }
     job = latest;
     const current = job.items.find((entry) => entry.packageId === item.packageId);
     if (current && ['queued', 'ready', 'failed', 'waiting_session'].includes(current.status)) {
-      await deliverItem(job, current, adapterResolver);
+      await deliverItem(job, current, adapterResolver, signal);
+      const persisted = await getEntity('deliveryJobs', jobId, 'jobId');
+      if (!persisted || persisted.status === 'cancelled') return persisted;
       job.updatedAt = now();
       await putEntity('deliveryJobs', job, 'jobId');
     }
@@ -329,7 +387,12 @@ export async function runDeliveryJob(jobId, { adapterResolver = defaultAdapter }
 
 export function enqueueDeliveryJob(jobId, options = {}) {
   if (deliveryRuns.has(jobId)) return deliveryRuns.get(jobId);
-  const run = runDeliveryJob(jobId, options).finally(() => deliveryRuns.delete(jobId));
+  const controller = new AbortController();
+  deliveryControllers.set(jobId, controller);
+  const run = runDeliveryJob(jobId, { ...options, signal: options.signal || controller.signal }).finally(() => {
+    deliveryRuns.delete(jobId);
+    deliveryControllers.delete(jobId);
+  });
   deliveryRuns.set(jobId, run);
   return run;
 }
@@ -352,7 +415,8 @@ export async function retryDeliveryJob(jobId, options = {}) {
 }
 
 export async function cancelDeliveryJob(jobId) {
-  const job = await updateEntity('deliveryJobs', jobId, (current) => ({ ...current, status: 'cancelled', updatedAt: now(), items: current.items.map((item) => ['ready', 'waiting_session'].includes(item.status) ? { ...item, status: 'cancelled' } : item) }), 'jobId');
+  deliveryControllers.get(jobId)?.abort();
+  const job = await updateEntity('deliveryJobs', jobId, (current) => ({ ...current, status: 'cancelled', updatedAt: now(), events: [...current.events, { type: 'delivery.cancelled', at: now() }], items: current.items.map((item) => ['delivered', 'uncertain', 'failed', 'preflight_failed'].includes(item.status) ? item : { ...item, status: 'cancelled' }) }), 'jobId');
   if (!job) throw deliveryError('DELIVERY_JOB_NOT_FOUND', '没有找到发布任务', 404);
   return job;
 }
