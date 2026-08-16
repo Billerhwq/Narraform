@@ -4,6 +4,7 @@ import app from '../server/index.js';
 import { createChangeSet, hashContent } from '../server/change-set.js';
 import { executeContentOperation } from '../server/operation-engine.js';
 import { getOperationSpec, getPublicOperationSpecs, validateOperationSpec } from '../server/operation-specs.js';
+import { getContent, getContentVersions, saveContent } from '../server/store.js';
 
 const currentResult = {
   resultId: 'result-parent',
@@ -147,7 +148,7 @@ test('首次生成的 taskId 过期仍返回 TASK_NOT_FOUND', async () => {
   assert.equal(output.code, 'TASK_NOT_FOUND');
 });
 
-test('SSE 流式接口依次返回 started、delta、verifying、completed', async () => {
+test('SSE 流式接口依次返回 started、field.reset、delta、verifying、completed', async () => {
   const response = await fetch(`${baseUrl}/api/content-operations/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -157,8 +158,84 @@ test('SSE 流式接口依次返回 started、delta、verifying、completed', asy
   const text = await response.text();
   const events = [...text.matchAll(/^event: (.+)$/gm)].map((match) => match[1]);
   assert.equal(events[0], 'started');
+  assert.ok(events.includes('field.reset'));
   assert.ok(events.includes('delta'));
+  assert.ok(events.indexOf('field.reset') < events.indexOf('delta'));
   assert.ok(events.indexOf('verifying') > events.indexOf('delta'));
   assert.ok(events.indexOf('completed') > events.indexOf('verifying'));
   assert.match(text, /AI|operationId/);
+});
+
+test('SSE 流式操作保存一个新版本并返回 version.saved', async () => {
+  const initial = await saveContent({
+    name: '流式保存测试',
+    platform: currentResult.platform,
+    titleCandidates: currentResult.titleCandidates,
+    selectedTitleIndex: currentResult.selectedTitleIndex,
+    summary: currentResult.summary,
+    bodyMarkdown: currentResult.bodyMarkdown,
+    topics: currentResult.topics,
+  });
+  const response = await fetch(`${baseUrl}/api/content-operations/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request('polish', {
+      contentId: initial.id,
+      baseRevision: initial.revision,
+      preset: 'de_ai',
+    })),
+  });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const events = [...text.matchAll(/^event: (.+)$/gm)].map((match) => match[1]);
+  assert.ok(events.includes('version.saved'));
+  assert.ok(events.indexOf('version.saved') < events.indexOf('operation.completed'));
+
+  const saved = await getContent(initial.id);
+  const versions = await getContentVersions(initial.id);
+  assert.equal(saved.revision, 2);
+  assert.equal(versions.length, 2);
+  assert.notEqual(saved.bodyMarkdown, currentResult.bodyMarkdown);
+});
+
+test('SSE 流式操作中途取消时不保存半成品版本', async () => {
+  const initial = await saveContent({
+    name: '流式取消测试',
+    platform: currentResult.platform,
+    titleCandidates: currentResult.titleCandidates,
+    selectedTitleIndex: currentResult.selectedTitleIndex,
+    summary: currentResult.summary,
+    bodyMarkdown: `${currentResult.bodyMarkdown}\n\n这是一段用于确保流式输出持续足够长时间的补充内容。`,
+    topics: currentResult.topics,
+  });
+  const controller = new AbortController();
+  const response = await fetch(`${baseUrl}/api/content-operations/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: controller.signal,
+    body: JSON.stringify(request('polish', {
+      contentId: initial.id,
+      baseRevision: initial.revision,
+      preset: 'de_ai',
+      currentResult: initial.versions[0],
+      parentResultId: null,
+      bodyHash: hashContent(initial.versions[0].bodyMarkdown),
+    })),
+  });
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let received = '';
+  await assert.rejects(async () => {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += decoder.decode(value, { stream: true });
+      if (received.includes('event: field.delta')) controller.abort();
+    }
+  }, (error) => error.name === 'AbortError');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const saved = await getContent(initial.id);
+  assert.equal(saved.revision, 1);
+  assert.equal(saved.versions.length, 1);
+  assert.equal(saved.versions[0].bodyMarkdown, initial.versions[0].bodyMarkdown);
 });

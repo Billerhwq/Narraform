@@ -70,3 +70,23 @@ export function recommendStrategies(taskBrief) {
     option({ key: 'evidence_explainer', name: '证据解释', description: '围绕已经确认的能力和边界组织内容，强调可信度。', readerSituation: '读者对营销表达敏感，更关心产品到底能做什么', coreMessage: `${subject}应该用可核对事实说明价值和限制`, hook: '先给出一个克制、可验证的结论', structure: ['核心判断', '事实依据', '具体作用', '限制', '适合谁'], ctaIntent: '帮助理性决策', taskBrief, audience, goal, risk: '资料不足时不应用确定口吻补齐结论' }),
   ];
 }
+
+export function applyLearningRules(taskBrief, learningRules = [], excludedRuleIds = []) {
+  const excluded = new Set(excludedRuleIds);
+  const available = learningRules.map(({ ruleId, rule, sourceInsightId, appliesWhen, expiresAt }) => ({
+    ruleId, rule, sourceInsightId, appliesWhen, expiresAt,
+  }));
+  const applied = available.filter((item) => !excluded.has(item.ruleId));
+  return {
+    ...taskBrief,
+    learningRulesAvailable: available,
+    learningRulesApplied: applied,
+    excludedLearningRuleIds: available.filter((item) => excluded.has(item.ruleId)).map((item) => item.ruleId),
+    strategyOptions: recommendStrategies(taskBrief).map((strategy) => ({
+      ...strategy,
+      learningRuleIds: applied.map((item) => item.ruleId),
+      learningGuidance: applied.map((item) => item.rule),
+    })),
+    updatedAt: new Date().toISOString(),
+  };
+}

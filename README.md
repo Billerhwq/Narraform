@@ -46,9 +46,12 @@ Codex 在独立临时目录中以 `--ephemeral` 和只读沙箱运行，不读�
 npm test
 npm run build
 npm run test:e2e
+npm run test:e2e:roadmap
 ```
 
 `test:e2e` 要求前端与 API 已经运行。它会验证信息不足追问、资料读取、三策略选择、生成、自然化修改、质量检查、版本保存和重新打开；测试完成后会删除自己创建的内容记录。
+
+`test:e2e:roadmap` 验证素材理解、平台发布包、草稿回执、表现复盘、学习规则和移动端布局。默认生产模式不会伪造平台成功；仅设置 `NARRAFORM_DELIVERY_MODE=sandbox` 时使用本地草稿适配器。
 
 主要生成接口：
 
@@ -72,3 +75,20 @@ npm run test:e2e
 - `NARRAFORM-PLATFORM-COPY-SPEC-v2.md`：当前平台文案规范
 
 本地内容保存在 `data/`，该目录不进入 Git。
+
+## 后续四阶段路线图
+
+- [总体 PRD](./docs/roadmap/PRD-Narraform-Overall-Roadmap.md)
+- [PR-01：内容引擎产品化](./docs/roadmap/PR-01-Content-Engine-Productization.md)
+- [PR-02：全类型素材理解](./docs/roadmap/PR-02-Multimodal-Material-Understanding.md)
+- [PR-03：平台草稿发布](./docs/roadmap/PR-03-Draft-Publishing-Delivery.md)
+- [PR-04：反馈闭环](./docs/roadmap/PR-04-Feedback-Learning-Loop.md)
+- [四阶段实施与验收记录](./docs/roadmap/IMPLEMENTATION-ACCEPTANCE.md)
+
+运行四阶段高保真交互原型：
+
+```powershell
+npm run prototype:roadmap
+```
+
+打开 `http://127.0.0.1:5188/?phase=1`，右上角可切换四个阶段。运行 `npm run prototype:roadmap:capture` 可重新生成 PR 文档引用的四张 1440×960 原型图。
