@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { imageSize } from 'image-size';
 import { createTextMaterial, fetchWebMaterial, parseUploadedFile } from './materials.js';
 import { deleteEntity, getEntity, listEntities, putEntity, readMaterialAsset, removeMaterialAsset, removeMaterialSetAssets, saveMaterialAsset, updateEntity } from './roadmap-store.js';
 import { runAdapterOperation } from './adapter-runtime.js';
@@ -44,7 +45,13 @@ function textEvidence(item) {
 }
 
 function imageDimensions(buffer, mimeType) {
-  if (mimeType === 'image/png' && buffer.length >= 24) return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  try {
+    const dimensions = imageSize(buffer);
+    return { width: dimensions.width ?? null, height: dimensions.height ?? null };
+  } catch {
+    // Preserve support for minimally encoded PNG fixtures while treating unreadable images as unknown.
+    if (mimeType === 'image/png' && buffer.length >= 24) return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+  }
   return { width: null, height: null };
 }
 

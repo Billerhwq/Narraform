@@ -13,6 +13,9 @@ function pngBuffer(width = 1440, height = 960) {
   return buffer;
 }
 
+const ONE_PIXEL_JPEG = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAX/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABAf/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPxB//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPxB//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxB//9k=', 'base64');
+const ONE_PIXEL_WEBP = Buffer.from('UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEAAUAmJQBOgCH4AA==', 'base64');
+
 test('PR-02 截图、用户说明和文档进入统一 MaterialSet 且证据分级', async () => {
   const created = await createMaterialSet({ instruction: 'CodeLoop 是一个协助完成编码任务的 Agent。' });
   const output = await addMaterialSetItems(created.materialSetId, {
@@ -34,6 +37,25 @@ test('PR-02 截图、用户说明和文档进入统一 MaterialSet 且证据分�
   assert.equal(output.materialSet.analysis.imageObservations[0].usableForClaims, false);
   assert.equal(output.materialSet.analysis.imageObservations[0].locator.x, 118);
   assert.deepEqual(output.materialSet.analysis.unknowns, ['截图不能证明任务执行是否完全自动']);
+});
+
+test('PR-02 PNG、JPEG 和 WebP 均持久化原图尺寸供证据定位使用', async () => {
+  const created = await createMaterialSet();
+  const files = [
+    { originalname: 'screen.png', mimetype: 'image/png', buffer: pngBuffer(1440, 960) },
+    { originalname: 'screen.jpg', mimetype: 'image/jpeg', buffer: ONE_PIXEL_JPEG },
+    { originalname: 'screen.webp', mimetype: 'image/webp', buffer: ONE_PIXEL_WEBP },
+  ].map((file) => ({ ...file, size: file.buffer.length }));
+  const output = await addMaterialSetItems(created.materialSetId, {
+    files,
+    visionClient: async () => ({ status: 'ready', observations: [], unknowns: [] }),
+  });
+  const dimensions = Object.fromEntries(output.materialSet.items.map((item) => [item.mimeType, [item.width, item.height]]));
+  assert.deepEqual(dimensions, {
+    'image/png': [1440, 960],
+    'image/jpeg': [1, 1],
+    'image/webp': [1, 1],
+  });
 });
 
 test('PR-02 图片观察只有经用户确认后才能进入生成 FactSet', async () => {
