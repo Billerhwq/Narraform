@@ -27,7 +27,7 @@
 | 五类操作统一入口 | `server/operation-specs.js`、`server/operation-engine.js`、`POST /api/content-operations/stream` | `tests/operation-engine.test.js` | 通过 |
 | 标题与正文按字段权限联动 | `server/field-permissions.js`、ChangeSet 哈希校验 | 换标题、换正文、选区润色用例 | 通过 |
 | 流式、取消、内部重试 | SSE 双协议事件、`AbortController`、最多两轮质量重试 | SSE、AbortSignal、自动重试用例 | 通过 |
-| 500ms 自动保存与恢复 | `src/main.jsx` 500ms 防抖；`server/store.js` 乐观锁与单调 revision | `tests/roadmap-content-state.test.js` | 通过 |
+| 500ms 自动保存与恢复 | `src/main.jsx` 编辑序号调度；`rich-text-editor.jsx` 隔离外部同步；`server/store.js` 乐观锁 | 内容状态用例；浏览器人工编辑仅一次保存 | 通过 |
 | 正式版本只保存完整结果 | 服务端在操作完成后事务保存并发送 `version.saved` | “SSE 流式操作保存一个新版本” | 通过 |
 | 前端职责拆分 | 应用壳、检查抽屉、富文本画布和阶段页面分别位于独立模块 | 构建与浏览器 E2E | 通过 |
 
@@ -112,6 +112,7 @@ Spec 示例：
 | 验收要求 | 实现证据 | 测试证据 | 状态 |
 |---|---|---|---|
 | 快照绑定内容版本与回执 | PerformanceSnapshot 保存 revision、receiptId 和来源 | `tests/roadmap-feedback-loop.test.js` | 通过 |
+| 内容年龄不伪造 | 有回执时根据 submittedAt/capturedAt 计算；无回执时由用户输入 | 回执时间推导、负数拒绝用例 | 通过 |
 | 原始与统一指标并存 | rawMetrics、normalizedMetrics、派生公式 | 缺失指标不视为 0 用例 | 通过 |
 | 同类基线与最低样本 | 同平台、同目标、同类型、相近内容年龄，至少 5 条 | 样本不足和同类基线用例 | 通过 |
 | 相关性而非因果 | Insight 固定 `causalClaim=false` 并使用假设措辞 | 复盘契约测试 | 通过 |
@@ -141,7 +142,10 @@ npm run build
 结果：通过；新增页面形成独立 roadmap-pages chunk。
 
 npm test
-结果：225 项通过，0 失败（包含 4 项可靠性与性能演练及重复经验去重）。
+结果：234 项通过，0 失败（包含取消、续传、回执时间、快照去重、忽略建议和删除级联）。
+
+npm run test:e2e
+结果：普通创作、换标题、换正文、自动保存、版本、检查和移动端导航通过；控制台错误 0，横向溢出 0。
 
 npm run test:e2e:roadmap
 结果：异步素材、内容、异步发布包、沙箱草稿回执、表现快照、学习规则和移动端无溢出全部通过。

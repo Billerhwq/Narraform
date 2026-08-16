@@ -70,6 +70,8 @@ try {
   const contentData = await api('/api/contents');
   const currentContent = contentData.contents[0];
   if (!currentContent) throw new Error('内容没有自动保存');
+  const currentGoal = currentContent.latestVersion?.strategySnapshot?.goal || 'awareness';
+  const currentContentType = currentContent.latestVersion?.strategySnapshot?.contentType || 'general_article';
 
   await page.getByRole('button', { name: '发布', exact: true }).click();
   await page.getByRole('heading', { name: '保存到平台草稿' }).waitFor();
@@ -85,8 +87,8 @@ try {
   const receiptId = jobs.jobs[0].items[0].receiptId;
 
   for (let index = 0; index < 5; index += 1) {
-    const baseline = await api('/api/contents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `E2E 同类基线 ${token}-${index}`, platform: 'xiaohongshu', titleCandidates: [`同类标题 ${index}`], bodyMarkdown: '同平台同目标的基线内容', strategySnapshot: { goal: 'save', contentType: 'product_marketing' } }) });
-    await api('/api/performance-snapshots', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId: baseline.content.id, contentRevision: 1, platform: 'xiaohongshu', goal: 'save', contentType: 'product_marketing', ageHours: 48, source: 'manual', metrics: { reads: 10000, saves: 300 + index * 10 } }) });
+    const baseline = await api('/api/contents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `E2E 同类基线 ${token}-${index}`, platform: 'xiaohongshu', titleCandidates: [`同类标题 ${index}`], bodyMarkdown: '同平台同目标的基线内容', strategySnapshot: { goal: currentGoal, contentType: currentContentType } }) });
+    await api('/api/performance-snapshots', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId: baseline.content.id, contentRevision: 1, platform: 'xiaohongshu', goal: currentGoal, contentType: currentContentType, ageHours: 0, source: 'manual', metrics: { reads: 10000, saves: 300 + index * 10 } }) });
   }
 
   await page.getByRole('button', { name: '复盘', exact: true }).click();
@@ -111,11 +113,7 @@ try {
   await page.getByText('已用于下次创作', { exact: true }).waitFor();
 
   const snapshots = await api(`/api/contents/${currentContent.id}/performance`);
-  if (!snapshots.snapshots[0]?.receiptId && receiptId) {
-    // UI manual entry is allowed without a receipt; the verified receipt remains independently queryable.
-    const receipt = await api(`/api/delivery-receipts/${receiptId}`);
-    if (!receipt.receipt.verified) throw new Error('草稿回执未验证');
-  }
+  if (snapshots.snapshots[0]?.receiptId !== receiptId) throw new Error('表现数据没有绑定已验证的草稿回执');
   const rules = await api('/api/learning-rules');
   if (!rules.rules.some((rule) => rule.status === 'active')) throw new Error('批准后的经验没有进入策略上下文');
 
@@ -127,6 +125,12 @@ try {
   await page.getByText('已确认的创作经验', { exact: true }).waitFor({ timeout: 30_000 });
   await page.getByRole('button', { name: '本次不采用' }).first().waitFor({ timeout: 30_000 });
 
+  await page.getByRole('button', { name: '复盘', exact: true }).click();
+  await page.getByRole('heading', { name: '内容复盘' }).waitFor();
+  const mobileContentSelect = page.locator('.review-workspace .roadmap-page-actions .arco-select');
+  await mobileContentSelect.click();
+  await page.locator('.arco-select-popup').getByText(currentContent.name, { exact: true }).click();
+  await page.getByText('最新阅读', { exact: true }).waitFor();
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(300);
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);

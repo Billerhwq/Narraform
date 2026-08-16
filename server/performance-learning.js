@@ -23,6 +23,23 @@ const ALIASES = {
   comments: 'comments', replies: 'comments',
   shares: 'shares', forwards: 'shares',
 };
+const METRIC_SOURCES = new Set(['platform_api', 'browser', 'manual']);
+const DATA_QUALITIES = new Set(['complete', 'partial', 'unverified']);
+
+function validatedAgeHours(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) throw performanceError('PERFORMANCE_AGE_INVALID', '发布后经过时间必须是大于或等于 0 的小时数');
+  return round(numeric, 2);
+}
+
+function hoursBetween(start, end) {
+  const startTime = new Date(start).getTime();
+  const endTime = new Date(end).getTime();
+  if (!Number.isFinite(startTime) || !Number.isFinite(endTime) || endTime < startTime) {
+    throw performanceError('PERFORMANCE_CAPTURE_TIME_INVALID', '表现数据的采集时间不能早于发布时间');
+  }
+  return round((endTime - startTime) / 3_600_000, 2);
+}
 
 export function normalizeMetrics(rawMetrics = {}) {
   const normalized = {};
@@ -56,23 +73,35 @@ export async function createPerformanceSnapshot(input) {
     if (!receipt) throw performanceError('DELIVERY_RECEIPT_NOT_FOUND', '没有找到发布回执', 404);
     if (receipt.contentId !== content.id || Number(receipt.contentRevision) !== Number(version.revision || input.contentRevision)) throw performanceError('PERFORMANCE_RECEIPT_MISMATCH', '发布回执与内容版本不一致', 409);
   }
-  if (!['platform_api', 'browser', 'manual'].includes(input.source)) throw performanceError('METRIC_SOURCE_UNSUPPORTED', '数据来源必须是平台接口、浏览器读取或手工录入');
+  if (!METRIC_SOURCES.has(input.source)) throw performanceError('METRIC_SOURCE_UNSUPPORTED', '数据来源必须是平台接口、浏览器读取或手工录入');
   const capturedAt = input.capturedAt || now();
+  const ageHours = receipt?.submittedAt
+    ? hoursBetween(receipt.submittedAt, capturedAt)
+    : validatedAgeHours(input.ageHours ?? 0);
+  const dataQuality = input.dataQuality || 'complete';
+  if (!DATA_QUALITIES.has(dataQuality)) throw performanceError('METRIC_DATA_QUALITY_UNSUPPORTED', '数据完整度只能是完整、部分或待核实');
+  const duplicate = (await listEntities('performanceSnapshots')).find((item) => item.contentId === content.id
+    && Number(item.contentRevision) === Number(version.revision || input.contentRevision)
+    && (item.receiptId || null) === (receipt?.receiptId || null)
+    && item.source === input.source
+    && item.capturedAt === capturedAt);
+  if (duplicate) return duplicate;
   const snapshot = {
     snapshotId: `perf_${crypto.randomUUID()}`,
     contentId: content.id,
     contentRevision: Number(version.revision || input.contentRevision || content.versions.length),
     receiptId: receipt?.receiptId || null,
     receiptVerified: receipt ? Boolean(receipt.verified) : false,
+    publicationLinkStatus: receipt ? (receipt.verified ? 'verified' : 'pending') : 'unlinked',
     platform: input.platform || receipt?.platform || version.platform || content.platform,
     goal: input.goal || version.strategySnapshot?.goal || 'awareness',
     contentType: input.contentType || version.strategySnapshot?.contentType || 'general_article',
     capturedAt,
-    ageHours: Number(input.ageHours ?? 0),
+    ageHours,
     source: input.source,
     rawMetrics: structuredClone(input.rawMetrics || input.metrics || {}),
     normalizedMetrics: normalizeMetrics(input.rawMetrics || input.metrics || {}),
-    dataQuality: input.dataQuality || 'complete',
+    dataQuality,
     createdAt: now(),
   };
   await putEntity('performanceSnapshots', snapshot, 'snapshotId');
@@ -189,6 +218,7 @@ export async function generateRetrospective(contentId, snapshotId = null) {
 export async function approveInsight(insightId) {
   const insight = await getEntity('retrospectiveInsights', insightId, 'insightId');
   if (!insight) throw performanceError('INSIGHT_NOT_FOUND', '没有找到这条复盘建议', 404);
+  if (insight.status === 'dismissed') throw performanceError('INSIGHT_DISMISSED', '这条复盘建议已忽略，不能再用于后续创作', 409);
   const existing = (await listEntities('learningRules')).find((item) => item.sourceInsightId === insightId);
   if (existing) return existing;
   const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();

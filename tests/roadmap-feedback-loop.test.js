@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { deleteContent, resetStore, saveContent } from '../server/store.js';
-import { resetRoadmapStore } from '../server/roadmap-store.js';
-import { approveInsight, createPerformanceSnapshot, deletePerformanceForContent, deletePerformanceSnapshot, generateRetrospective, getStrategyContext, listContentPerformance, listLearningRules, normalizeMetrics, syncPerformanceSnapshot } from '../server/performance-learning.js';
+import { putEntity, resetRoadmapStore } from '../server/roadmap-store.js';
+import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getStrategyContext, listContentPerformance, listLearningRules, normalizeMetrics, syncPerformanceSnapshot } from '../server/performance-learning.js';
 
 test.beforeEach(async () => { await resetStore(); await resetRoadmapStore(); });
 
@@ -40,6 +40,37 @@ test('PR-04 平台指标连接器保留来源和原始字段，失败不产生�
   assert.equal((await listContentPerformance(current.id)).length, 1);
 });
 
+test('PR-04 绑定发布回执时按真实提交时间计算内容年龄', async () => {
+  const current = await content('回执绑定内容');
+  const receipt = {
+    receiptId: 'rcpt_age_contract', contentId: current.id, contentRevision: 1,
+    platform: 'xiaohongshu', submittedAt: '2026-08-16T08:00:00.000Z',
+    verified: true, status: 'delivered',
+  };
+  await putEntity('deliveryReceipts', receipt, 'receiptId');
+  const snapshot = await createPerformanceSnapshot({
+    contentId: current.id, contentRevision: 1, receiptId: receipt.receiptId,
+    capturedAt: '2026-08-17T14:00:00.000Z', ageHours: 999,
+    source: 'manual', metrics: { reads: 1200 },
+  });
+  assert.equal(snapshot.ageHours, 30);
+  assert.equal(snapshot.publicationLinkStatus, 'verified');
+});
+
+test('PR-04 未绑定回执的时间必须有效，相同采集时点自动去重', async () => {
+  const current = await content('快照去重内容');
+  await assert.rejects(
+    () => createPerformanceSnapshot({ contentId: current.id, source: 'manual', ageHours: -1, metrics: { reads: 1 } }),
+    (error) => error.code === 'PERFORMANCE_AGE_INVALID',
+  );
+  const input = { contentId: current.id, source: 'manual', ageHours: 12, capturedAt: '2026-08-17T00:00:00.000Z', metrics: { reads: 300 }, dataQuality: 'partial' };
+  const first = await createPerformanceSnapshot(input);
+  const duplicate = await createPerformanceSnapshot(input);
+  assert.equal(duplicate.snapshotId, first.snapshotId);
+  assert.equal((await listContentPerformance(current.id)).length, 1);
+  assert.equal(first.publicationLinkStatus, 'unlinked');
+});
+
 test('PR-04 样本少于 5 条时只返回数据，不生成趋势建议', async () => {
   const current = await content('当前内容');
   await createPerformanceSnapshot({ contentId: current.id, source: 'manual', platform: 'xiaohongshu', goal: 'save', contentType: 'product_marketing', ageHours: 48, metrics: { reads: 1000, saves: 60 } });
@@ -73,6 +104,32 @@ test('PR-04 同类基线产生证据化建议，批准后才进入策略上下�
   const context = await getStrategyContext({ platform: 'xiaohongshu', goal: 'save', contentType: 'product_marketing' });
   assert.equal(context.length, 1);
   assert.equal(context[0].sourceInsightId, result.insight.insightId);
+});
+
+test('PR-04 用户忽略的建议不能再被批准', async () => {
+  const current = await content('忽略建议内容');
+  await createPerformanceSnapshot({ contentId: current.id, source: 'manual', ageHours: 48, metrics: { reads: 1000, saves: 90 } });
+  for (let index = 0; index < 5; index += 1) {
+    const baseline = await content(`忽略基线 ${index}`);
+    await createPerformanceSnapshot({ contentId: baseline.id, source: 'manual', ageHours: 48, metrics: { reads: 1000, saves: 30 } });
+  }
+  const result = await generateRetrospective(current.id);
+  await dismissInsight(result.insight.insightId);
+  await assert.rejects(() => approveInsight(result.insight.insightId), (error) => error.code === 'INSIGHT_DISMISSED');
+  assert.equal((await listLearningRules()).length, 0);
+});
+
+test('PR-04 删除回执时只级联清理与它绑定的表现链', async () => {
+  const current = await content('回执删除内容');
+  const receipt = { receiptId: 'rcpt_delete_contract', contentId: current.id, contentRevision: 1, platform: 'xiaohongshu', submittedAt: '2026-08-16T08:00:00.000Z', verified: true, status: 'delivered' };
+  await putEntity('deliveryReceipts', receipt, 'receiptId');
+  await createPerformanceSnapshot({ contentId: current.id, receiptId: receipt.receiptId, capturedAt: '2026-08-17T08:00:00.000Z', source: 'manual', metrics: { reads: 1000 } });
+  await createPerformanceSnapshot({ contentId: current.id, ageHours: 24, capturedAt: '2026-08-17T09:00:00.000Z', source: 'manual', metrics: { reads: 1100 } });
+  const removed = await deletePerformanceByReceipt(receipt.receiptId);
+  assert.equal(removed.snapshots, 1);
+  const remaining = await listContentPerformance(current.id);
+  assert.equal(remaining.length, 1);
+  assert.equal(remaining[0].receiptId, null);
 });
 
 test('PR-04 删除内容时清理表现、复盘建议和对应学习规则', async () => {

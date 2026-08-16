@@ -365,25 +365,83 @@ export function ReviewWorkspace() {
   const [contents, setContents] = useState([]);
   const [contentId, setContentId] = useState('');
   const [snapshots, setSnapshots] = useState([]);
+  const [snapshotIndex, setSnapshotIndex] = useState({});
+  const [receipts, setReceipts] = useState([]);
+  const [learningRules, setLearningRules] = useState([]);
   const [retrospective, setRetrospective] = useState(null);
   const [metricOpen, setMetricOpen] = useState(false);
   const [metrics, setMetrics] = useState({ impressions: '', reads: '', likes: '', saves: '', comments: '', shares: '' });
+  const [ageHours, setAgeHours] = useState('24');
   const [loading, setLoading] = useState(false);
   const [approvedRule, setApprovedRule] = useState(null);
   const [ruleDraft, setRuleDraft] = useState('');
 
-  useEffect(() => { request('/api/contents').then((data) => { setContents(data.contents || []); setContentId(data.contents?.[0]?.id || ''); }).catch((error) => Message.error(error.message)); }, []);
-  useEffect(() => { if (!contentId) return; request(`/api/contents/${contentId}/performance`).then((data) => { setSnapshots(data.snapshots); setRetrospective(null); setApprovedRule(null); setRuleDraft(''); }).catch((error) => Message.error(error.message)); }, [contentId]);
+  const refreshOverview = async (contentItems = contents) => {
+    if (!contentItems.length) { setSnapshotIndex({}); return; }
+    const entries = await Promise.all(contentItems.map(async (item) => {
+      const data = await request(`/api/contents/${item.id}/performance`);
+      return [item.id, data.snapshots || []];
+    }));
+    setSnapshotIndex(Object.fromEntries(entries));
+  };
+
+  useEffect(() => {
+    Promise.all([request('/api/contents'), request('/api/delivery-receipts'), request('/api/learning-rules')])
+      .then(async ([contentData, receiptData, ruleData]) => {
+        const contentItems = contentData.contents || [];
+        setContents(contentItems);
+        setContentId(contentItems[0]?.id || '');
+        setReceipts(receiptData.receipts || []);
+        setLearningRules(ruleData.rules || []);
+        await refreshOverview(contentItems);
+      })
+      .catch((error) => Message.error(error.message));
+  }, []);
+
+  useEffect(() => {
+    if (!contentId) { setSnapshots([]); return; }
+    request(`/api/contents/${contentId}/performance`).then((data) => {
+      setSnapshots(data.snapshots || []);
+      setRetrospective(null);
+      setApprovedRule(null);
+      setRuleDraft('');
+    }).catch((error) => Message.error(error.message));
+  }, [contentId]);
+
   const selectedContent = contents.find((item) => item.id === contentId);
   const current = snapshots[0];
+  const selectedReceipt = receipts
+    .filter((item) => item.contentId === contentId && (!selectedContent || Number(item.contentRevision) === Number(selectedContent.revision)))
+    .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt))[0] || null;
+  const selectedGoal = selectedContent?.latestVersion?.strategySnapshot?.goal || 'awareness';
+  const selectedContentType = selectedContent?.latestVersion?.strategySnapshot?.contentType || 'general_article';
+  const deliveredContentIds = new Set(receipts.filter((item) => item.status === 'delivered' && item.verified).map((item) => item.contentId));
+  const deliveredCount = receipts.filter((item) => item.status === 'delivered' && item.verified).length;
+  const pendingDataCount = [...deliveredContentIds].filter((id) => !(snapshotIndex[id]?.length)).length;
+  const activeRuleCount = learningRules.filter((item) => item.status === 'active' && new Date(item.expiresAt).getTime() > Date.now()).length;
+
+  const performancePayload = (source) => ({
+    contentId,
+    contentRevision: selectedContent.revision,
+    ...(selectedReceipt ? { receiptId: selectedReceipt.receiptId } : { ageHours: Number(ageHours) }),
+    platform: selectedContent.platform,
+    goal: selectedGoal,
+    contentType: selectedContentType,
+    source,
+  });
 
   const saveMetrics = async () => {
     const rawMetrics = Object.fromEntries(Object.entries(metrics).filter(([, value]) => value !== '').map(([key, value]) => [key, Number(value)]));
     if (!Object.keys(rawMetrics).length) return;
+    if (!selectedReceipt && (!Number.isFinite(Number(ageHours)) || Number(ageHours) < 0)) return Message.warning('请填写发布后经过的小时数');
     setLoading(true);
     try {
-      const data = await request('/api/performance-snapshots', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId, contentRevision: selectedContent.revision, platform: selectedContent.platform, goal: 'save', contentType: selectedContent.latestVersion?.strategySnapshot?.contentType || 'product_marketing', ageHours: 48, source: 'manual', rawMetrics, dataQuality: 'complete' }) });
-      setSnapshots((items) => [data.snapshot, ...items]); setMetricOpen(false); Message.success('表现数据已保存');
+      const data = await request('/api/performance-snapshots', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...performancePayload('manual'), rawMetrics, dataQuality: 'complete' }) });
+      setSnapshots((items) => [data.snapshot, ...items.filter((item) => item.snapshotId !== data.snapshot.snapshotId)]);
+      setSnapshotIndex((items) => ({ ...items, [contentId]: [data.snapshot, ...(items[contentId] || []).filter((item) => item.snapshotId !== data.snapshot.snapshotId)] }));
+      setMetricOpen(false);
+      setMetrics({ impressions: '', reads: '', likes: '', saves: '', comments: '', shares: '' });
+      Message.success('表现数据已保存');
       const review = await request(`/api/contents/${contentId}/retrospective`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ snapshotId: data.snapshot.snapshotId }) });
       setRetrospective(review);
     } catch (error) { Message.error(error.message); }
@@ -394,8 +452,9 @@ export function ReviewWorkspace() {
     if (!selectedContent) return;
     setLoading(true);
     try {
-      const data = await request('/api/performance-snapshots/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId, contentRevision: selectedContent.revision, platform: selectedContent.platform, goal: 'save', contentType: selectedContent.latestVersion?.strategySnapshot?.contentType || 'product_marketing', ageHours: 48 }) });
-      setSnapshots((items) => [data.snapshot, ...items]);
+      const data = await request('/api/performance-snapshots/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(performancePayload('platform_api')) });
+      setSnapshots((items) => [data.snapshot, ...items.filter((item) => item.snapshotId !== data.snapshot.snapshotId)]);
+      await refreshOverview();
       Message.success('平台表现已同步');
     } catch (error) { Message.warning(error.message); }
     finally { setLoading(false); }
@@ -409,7 +468,7 @@ export function ReviewWorkspace() {
   };
 
   const approve = async () => {
-    try { const data = await request(`/api/learning-rules/${retrospective.insight.insightId}/approve`, { method: 'POST' }); setApprovedRule(data.rule); setRuleDraft(data.rule.rule); setRetrospective((value) => ({ ...value, insight: { ...value.insight, status: 'approved' } })); Message.success('这条经验会在适用的新任务中显示'); }
+    try { const data = await request(`/api/learning-rules/${retrospective.insight.insightId}/approve`, { method: 'POST' }); setApprovedRule(data.rule); setLearningRules((items) => [data.rule, ...items.filter((item) => item.ruleId !== data.rule.ruleId)]); setRuleDraft(data.rule.rule); setRetrospective((value) => ({ ...value, insight: { ...value.insight, status: 'approved' } })); Message.success('这条经验会在适用的新任务中显示'); }
     catch (error) { Message.error(error.message); }
   };
 
@@ -417,21 +476,76 @@ export function ReviewWorkspace() {
     if (!approvedRule) return;
     try {
       const data = await request(`/api/learning-rules/${approvedRule.ruleId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
-      setApprovedRule(data.rule); setRuleDraft(data.rule.rule);
+      setApprovedRule(data.rule); setLearningRules((items) => items.map((item) => item.ruleId === data.rule.ruleId ? data.rule : item)); setRuleDraft(data.rule.rule);
       Message.success(patch.status === 'inactive' ? '已停用这条经验' : '创作经验已更新');
     } catch (error) { Message.error(error.message); }
   };
+
+  const dismiss = async () => {
+    try {
+      await request(`/api/learning-rules/${retrospective.insight.insightId}/dismiss`, { method: 'POST' });
+      setRetrospective((value) => ({ ...value, insight: { ...value.insight, status: 'dismissed' } }));
+      Message.success('这条建议已忽略');
+    } catch (error) { Message.error(error.message); }
+  };
+
+  const removeSnapshot = (snapshot) => Modal.confirm({
+    title: '删除这条表现记录？',
+    content: '由这条记录形成的复盘建议和已批准经验也会一起删除。',
+    okButtonProps: { status: 'danger' },
+    onOk: async () => {
+      await request(`/api/performance-snapshots/${snapshot.snapshotId}`, { method: 'DELETE' });
+      setSnapshots((items) => items.filter((item) => item.snapshotId !== snapshot.snapshotId));
+      setSnapshotIndex((items) => ({ ...items, [contentId]: (items[contentId] || []).filter((item) => item.snapshotId !== snapshot.snapshotId) }));
+      setRetrospective(null);
+      setApprovedRule(null);
+      setLearningRules((await request('/api/learning-rules')).rules || []);
+      Message.success('表现记录已删除');
+    },
+  });
+
+  const removeReceipt = () => selectedReceipt && Modal.confirm({
+    title: '删除这条发布回执？',
+    content: '与这条回执绑定的表现记录和复盘建议也会一起删除。',
+    okButtonProps: { status: 'danger' },
+    onOk: async () => {
+      await request(`/api/delivery-receipts/${selectedReceipt.receiptId}`, { method: 'DELETE' });
+      setReceipts((items) => items.filter((item) => item.receiptId !== selectedReceipt.receiptId));
+      const data = await request(`/api/contents/${contentId}/performance`);
+      setSnapshots(data.snapshots || []);
+      setSnapshotIndex((items) => ({ ...items, [contentId]: data.snapshots || [] }));
+      setRetrospective(null);
+      Message.success('发布回执已删除');
+    },
+  });
 
   const saveRate = metricValue(current, 'saveRate');
   return <section className="roadmap-workspace review-workspace">
     <PageHeading eyebrow="反馈闭环" title="内容复盘" subtitle="表现只和同平台、同目标、同内容类型比较，建议由你决定是否复用" actions={<><Select value={contentId} onChange={setContentId} placeholder="选择内容" style={{ width: 250 }}>{contents.map((item) => <Select.Option key={item.id} value={item.id}>{item.name}</Select.Option>)}</Select><Button icon={<IconRefresh />} loading={loading} disabled={!contentId} onClick={syncMetrics}>同步平台数据</Button><Button type="primary" icon={<IconPlus />} disabled={!contentId} onClick={() => setMetricOpen(true)}>补充表现数据</Button></>} />
     {!selectedContent ? <div className="roadmap-empty-action"><Empty description="完成并保存内容后可以记录表现" /></div> : <div className="review-workbench">
-      <main className="review-timeline"><div className="review-summary-strip"><div><span className="review-summary-icon"><IconSend /></span><span><small>内容版本</small><strong>{selectedContent.revision || selectedContent.versionCount}</strong></span></div><div><span className="review-summary-icon amber"><IconCalendar /></span><span><small>表现快照</small><strong>{snapshots.length}</strong></span></div><div><span className="review-summary-icon green"><IconExperiment /></span><span><small>复盘状态</small><strong>{retrospective?.insight ? '有建议' : current ? '待复盘' : '待数据'}</strong></span></div></div>
-        <section className="content-journey"><div className="journey-heading"><h2>{selectedContent.name}</h2><Tag color="red">{platformMeta[selectedContent.platform]?.label || selectedContent.platform}</Tag><span>版本 {selectedContent.revision || selectedContent.versionCount}</span></div><div className="journey-steps"><div className="done"><i><IconCheck /></i><span><strong>内容已保存</strong><small>事实与平台检查完成</small></span></div><b /><div className={current ? 'done' : ''}><i>{current ? <IconCheck /> : '2'}</i><span><strong>表现已收集</strong><small>{current ? `${current.ageHours} 小时 · ${current.source === 'manual' ? '手工录入' : '平台同步'}` : '等待补充平台数据'}</small></span></div><b /><div className={retrospective ? 'active' : ''}><i><IconExperiment /></i><span><strong>形成复盘</strong><small>{retrospective?.insight ? '有一条建议待决定' : retrospective?.baseline?.status === 'insufficient' ? '同类样本不足' : '尚未生成'}</small></span></div></div></section>
-        <section className="snapshot-history"><div className="material-block-heading"><div><h2>表现记录</h2><span>每次采集生成独立快照，不覆盖历史</span></div>{current && <Button icon={<IconRefresh />} loading={loading} onClick={generateReview}>生成复盘</Button>}</div>{snapshots.length ? snapshots.map((snapshot) => <div className="snapshot-row" key={snapshot.snapshotId}><span className="platform-square red">小</span><span><strong>{new Date(snapshot.capturedAt).toLocaleString('zh-CN')}</strong><small>{snapshot.source === 'manual' ? '手工录入' : '平台同步'} · 数据{snapshot.dataQuality === 'complete' ? '完整' : '部分'}</small></span><span><small>阅读</small><b>{snapshot.normalizedMetrics.reads?.toLocaleString?.() ?? '—'}</b></span><span><small>收藏</small><b>{snapshot.normalizedMetrics.saves?.toLocaleString?.() ?? '—'}</b></span><span><small>收藏率</small><b>{metricValue(snapshot, 'saveRate') !== undefined ? `${(metricValue(snapshot, 'saveRate') * 100).toFixed(2)}%` : '—'}</b></span></div>) : <Empty description="还没有表现数据，发布后可以手工录入或从平台同步" />}</section>
+      <main className="review-timeline">
+        <div className="review-summary-strip"><div><span className="review-summary-icon"><IconSend /></span><span><small>已送达</small><strong>{deliveredCount}</strong></span></div><div><span className="review-summary-icon amber"><IconCalendar /></span><span><small>待补数据</small><strong>{pendingDataCount}</strong></span></div><div><span className="review-summary-icon green"><IconExperiment /></span><span><small>可用经验</small><strong>{activeRuleCount}</strong></span></div></div>
+        <section className="content-week-timeline"><div className="material-block-heading"><div><h2>最近内容轨迹</h2><span>从保存到送达、表现和经验，一眼找到下一步</span></div></div><div className="week-track">{contents.slice(0, 7).map((item) => { const meta = platformMeta[item.platform] || { short: '文', tone: 'blue', label: item.platform }; const receipt = receipts.find((entry) => entry.contentId === item.id && entry.verified); const hasData = Boolean(snapshotIndex[item.id]?.length); return <button type="button" key={item.id} className={item.id === contentId ? 'active' : ''} onClick={() => setContentId(item.id)}><time>{new Date(item.updatedAt).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })}</time><span className={`platform-square ${meta.tone}`}>{meta.short}</span><span><strong>{item.name}</strong><small>{receipt ? hasData ? '已送达 · 已有表现' : '已送达 · 待补数据' : '内容已保存'}</small></span><i className={receipt ? hasData ? 'complete' : 'pending' : ''} /></button>; })}</div></section>
+        <section className="content-journey"><div className="journey-heading"><span className={`platform-square ${platformMeta[selectedContent.platform]?.tone || 'blue'}`}>{platformMeta[selectedContent.platform]?.short || '文'}</span><div><h2>{selectedContent.name}</h2><span>{platformMeta[selectedContent.platform]?.label || selectedContent.platform} · 版本 {selectedContent.revision || selectedContent.versionCount}</span></div>{selectedReceipt && <Tag color="green">回执已验证</Tag>}{selectedReceipt && <Tooltip content="删除发布回执"><Button className="journey-delete" type="text" status="danger" icon={<IconDelete />} aria-label="删除发布回执" onClick={removeReceipt} /></Tooltip>}</div><div className="journey-steps"><div className="done"><i><IconCheck /></i><span><strong>内容已保存</strong><small>事实与平台检查完成</small></span></div><b /><div className={selectedReceipt ? 'done' : ''}><i>{selectedReceipt ? <IconCheck /> : '2'}</i><span><strong>{selectedReceipt ? '平台已送达' : '等待平台回执'}</strong><small>{selectedReceipt ? `${selectedReceipt.verificationMethod} · ${new Date(selectedReceipt.submittedAt).toLocaleString('zh-CN')}` : '也可以先手工补充表现'}</small></span></div><b /><div className={current ? 'done' : ''}><i>{current ? <IconCheck /> : '3'}</i><span><strong>{current ? '表现已收集' : '等待表现数据'}</strong><small>{current ? `${current.ageHours} 小时 · ${current.source === 'manual' ? '手工录入' : '平台同步'}` : '数据留空不会按 0 处理'}</small></span></div></div></section>
+        <section className="snapshot-history"><div className="material-block-heading"><div><h2>表现记录</h2><span>每次采集生成独立快照，不覆盖历史</span></div>{current && <Button icon={<IconRefresh />} loading={loading} onClick={generateReview}>生成复盘</Button>}</div>{snapshots.length ? snapshots.map((snapshot) => { const meta = platformMeta[snapshot.platform] || { short: '文', tone: 'blue' }; return <div className="snapshot-row" key={snapshot.snapshotId}><span className={`platform-square ${meta.tone}`}>{meta.short}</span><span><strong>{new Date(snapshot.capturedAt).toLocaleString('zh-CN')}</strong><small>{snapshot.source === 'manual' ? '手工录入' : '平台同步'} · {snapshot.publicationLinkStatus === 'verified' ? '已关联发布' : '未关联发布'} · 数据{snapshot.dataQuality === 'complete' ? '完整' : '部分'}</small></span><span><small>阅读</small><b>{snapshot.normalizedMetrics.reads?.toLocaleString?.() ?? '—'}</b></span><span><small>收藏</small><b>{snapshot.normalizedMetrics.saves?.toLocaleString?.() ?? '—'}</b></span><span><small>收藏率</small><b>{metricValue(snapshot, 'saveRate') !== undefined ? `${(metricValue(snapshot, 'saveRate') * 100).toFixed(2)}%` : '—'}</b></span><Tooltip content="删除这条记录"><Button type="text" status="danger" icon={<IconDelete />} aria-label="删除表现记录" onClick={() => removeSnapshot(snapshot)} /></Tooltip></div>; }) : <Empty description="还没有表现数据，发布后可以手工录入或从平台同步" />}</section>
       </main>
-      <aside className="review-insight-panel">{current ? <><div className="current-performance"><span>最新阅读</span><strong>{current.normalizedMetrics.reads?.toLocaleString?.() ?? '—'}</strong><em>{current.ageHours} 小时表现</em></div><div className="performance-grid">{[['点赞','likes'],['收藏','saves'],['评论','comments'],['分享','shares']].map(([label,key]) => <div key={key}><span>{label}</span><strong>{current.normalizedMetrics[key]?.toLocaleString?.() ?? '—'}</strong></div>)}</div>{saveRate !== undefined && <div className="rate-benchmark"><span>收藏率</span><strong>{(saveRate * 100).toFixed(2)}%</strong><Progress percent={Math.min(100, Math.round(saveRate * 1000))} showText={false} /></div>}{retrospective ? retrospective.insight ? <section className="learning-insight"><div className="learning-title"><span><IconExperiment /></span><div><small>Narraform 复盘建议</small><strong>{retrospective.insight.observation}</strong></div><Tag color="orange">{retrospective.insight.confidence === 'high' ? '较高信心' : '中等信心'}</Tag></div><p>{retrospective.insight.hypothesis}</p><div className="insight-evidence">{retrospective.insight.evidence.map((item) => <span key={item}>{item}</span>)}</div><div className="next-use"><strong>下一篇怎么用</strong><span>{retrospective.insight.recommendation}</span></div>{approvedRule && <div className="approved-rule-editor"><Input value={ruleDraft} onChange={setRuleDraft} disabled={approvedRule.status === 'inactive'} aria-label="编辑创作经验" /><div><Button onClick={() => updateApprovedRule({ rule: ruleDraft })} disabled={approvedRule.status === 'inactive' || !ruleDraft.trim()}>更新经验</Button><Button status="danger" onClick={() => updateApprovedRule({ status: 'inactive' })} disabled={approvedRule.status === 'inactive'}>{approvedRule.status === 'inactive' ? '已停用' : '停用'}</Button></div></div>}<div className="insight-decisions">{retrospective.insight.status === 'approved' ? <span className="approved-rule"><IconCheckCircleFill /> {approvedRule?.status === 'inactive' ? '这条经验已停用' : '已用于下次创作'}</span> : <><Button onClick={async () => { await request(`/api/learning-rules/${retrospective.insight.insightId}/dismiss`, { method: 'POST' }); setRetrospective((value) => ({ ...value, insight: { ...value.insight, status: 'dismissed' } })); }}>忽略</Button><Button type="primary" icon={<IconCheck />} onClick={approve}>用于下次创作</Button></>}</div></section> : <Alert type="info" content={`目前只有 ${retrospective.baseline.sampleSize} 条同类样本。至少需要 5 条才会生成趋势建议，当前只展示原始数据。`} /> : <div className="review-callout"><IconExperiment /><strong>生成一次有依据的复盘</strong><span>系统会寻找同平台、同目标、同类型的内容作为基线，不会跨平台混比。</span><Button type="primary" loading={loading} onClick={generateReview}>生成复盘</Button></div>}<div className="causality-note"><IconInfoCircle /><span>复盘只表达相关性信号，不会把一次表现直接写成因果规律。</span></div></> : <div className="review-callout"><IconCalendar /><strong>先补充发布表现</strong><span>可以录入曝光、阅读、点赞、收藏、评论和分享。没有的指标保持空白，不会按 0 处理。</span><Button type="primary" onClick={() => setMetricOpen(true)}>补充表现数据</Button></div>}</aside>
+      <aside className="review-insight-panel">
+        {current ? <>
+          <div className="current-performance"><span>最新阅读</span><strong>{current.normalizedMetrics.reads?.toLocaleString?.() ?? '—'}</strong><em>{current.ageHours} 小时表现</em></div>
+          <div className="performance-grid">{[['点赞','likes'],['收藏','saves'],['评论','comments'],['分享','shares']].map(([label,key]) => <div key={key}><span>{label}</span><strong>{current.normalizedMetrics[key]?.toLocaleString?.() ?? '—'}</strong></div>)}</div>
+          {saveRate !== undefined && <div className="rate-benchmark"><span>收藏率</span><strong>{(saveRate * 100).toFixed(2)}%</strong><Progress percent={Math.min(100, Math.round(saveRate * 1000))} showText={false} /></div>}
+          {retrospective ? retrospective.insight ? <section className="learning-insight">
+            <div className="learning-title"><span><IconExperiment /></span><div><small>Narraform 复盘建议</small><strong>{retrospective.insight.observation}</strong></div><Tag color="orange">{retrospective.insight.confidence === 'high' ? '较高信心' : '中等信心'}</Tag></div>
+            <p>{retrospective.insight.hypothesis}</p>
+            <div className="insight-evidence">{retrospective.insight.evidence.map((item) => <span key={item}>{item}</span>)}</div>
+            <div className="next-use"><strong>下一篇怎么用</strong><span>{retrospective.insight.recommendation}</span></div>
+            {approvedRule && <div className="approved-rule-editor"><Input value={ruleDraft} onChange={setRuleDraft} onBlur={() => { if (ruleDraft.trim() && ruleDraft.trim() !== approvedRule.rule) updateApprovedRule({ rule: ruleDraft }); }} disabled={approvedRule.status === 'inactive'} aria-label="编辑创作经验" /><div><span>编辑后自动保存</span><Button status="danger" onClick={() => updateApprovedRule({ status: 'inactive' })} disabled={approvedRule.status === 'inactive'}>{approvedRule.status === 'inactive' ? '已停用' : '停用'}</Button></div></div>}
+            <div className="insight-decisions">{retrospective.insight.status === 'approved' ? <span className="approved-rule"><IconCheckCircleFill /> {approvedRule?.status === 'inactive' ? '这条经验已停用' : '已用于下次创作'}</span> : retrospective.insight.status === 'dismissed' ? <span className="dismissed-insight">已忽略，不会影响后续创作</span> : <><Button onClick={dismiss}>忽略</Button><Button type="primary" icon={<IconCheck />} onClick={approve}>用于下次创作</Button></>}</div>
+          </section> : <Alert type="info" content={`目前只有 ${retrospective.baseline.sampleSize} 条同类样本。至少需要 5 条才会生成趋势建议，当前只展示原始数据。`} /> : <div className="review-callout"><IconExperiment /><strong>生成一次有依据的复盘</strong><span>系统会寻找同平台、同目标、同类型的内容作为基线，不会跨平台混比。</span><Button type="primary" loading={loading} onClick={generateReview}>生成复盘</Button></div>}
+          <div className="causality-note"><IconInfoCircle /><span>复盘只表达相关性信号，不会把一次表现直接写成因果规律。</span></div>
+        </> : <div className="review-callout"><IconCalendar /><strong>先补充发布表现</strong><span>可以录入曝光、阅读、点赞、收藏、评论和分享。没有的指标保持空白，不会按 0 处理。</span><Button type="primary" onClick={() => setMetricOpen(true)}>补充表现数据</Button></div>}
+      </aside>
     </div>}
-    <Modal title="补充这篇内容的表现" visible={metricOpen} onCancel={() => setMetricOpen(false)} onOk={saveMetrics} okText="保存并复盘" okButtonProps={{ loading }}><div className="metric-form"><Alert type="info" content="只填写平台实际提供的数据。留空表示缺失，不会按 0 计算。" />{[['曝光','impressions'],['阅读','reads'],['点赞','likes'],['收藏','saves'],['评论','comments'],['分享','shares']].map(([label,key]) => <label key={key}><span>{label}</span><Input value={metrics[key]} onChange={(value) => setMetrics((currentValue) => ({ ...currentValue, [key]: value.replace(/\D/g, '') }))} placeholder="未提供可留空" /></label>)}</div></Modal>
+    <Modal title="补充这篇内容的表现" visible={metricOpen} onCancel={() => setMetricOpen(false)} onOk={saveMetrics} okText="保存并复盘" okButtonProps={{ loading }}><div className="metric-form"><Alert type="info" content="只填写平台实际提供的数据。留空表示缺失，不会按 0 计算。" />{selectedReceipt ? <div className="metric-receipt-link"><IconCheckCircleFill /><span><strong>已关联平台回执</strong><small>将根据 {new Date(selectedReceipt.submittedAt).toLocaleString('zh-CN')} 的提交时间自动计算内容年龄</small></span></div> : <label className="metric-age"><span>发布后经过小时</span><Input value={ageHours} onChange={(value) => setAgeHours(value.replace(/[^\d.]/g, ''))} placeholder="例如 24" suffix="小时" /></label>}{[['曝光','impressions'],['阅读','reads'],['点赞','likes'],['收藏','saves'],['评论','comments'],['分享','shares']].map(([label,key]) => <label key={key}><span>{label}</span><Input value={metrics[key]} onChange={(value) => setMetrics((currentValue) => ({ ...currentValue, [key]: value.replace(/\D/g, '') }))} placeholder="未提供可留空" /></label>)}</div></Modal>
   </section>;
 }
