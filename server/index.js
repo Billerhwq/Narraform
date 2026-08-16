@@ -167,6 +167,7 @@ app.post('/api/content-operations/stream', async (request, response) => {
     const field = output.changeSet.changedFields.includes('bodyMarkdown') ? 'bodyMarkdown'
       : output.changeSet.changedFields.includes('titleCandidates') ? 'titleCandidates' : output.changeSet.changedFields[0];
     const value = field === 'titleCandidates' ? JSON.stringify(output.result.titleCandidates) : String(output.result[field] ?? '');
+    writeSse(response, 'field.reset', { operationId: output.operationId, field });
     let index = 0;
     for (const character of value) {
       if (controller.signal.aborted) throw Object.assign(new Error('操作已取消'), { code: 'ABORTED', status: 499 });
@@ -176,10 +177,12 @@ app.post('/api/content-operations/stream', async (request, response) => {
       index += 1;
       await new Promise((resolve) => setTimeout(resolve, 12));
     }
+    if (controller.signal.aborted) throw Object.assign(new Error('操作已取消'), { code: 'ABORTED', status: 499 });
     const verification = { operationId: output.operationId, checks: ['field_permissions', 'facts', 'platform', 'operation_quality'] };
     writeSse(response, 'verifying', verification);
     writeSse(response, 'quality.completed', { operationId: output.operationId, qualityReport: output.result.qualityReport });
     if (request.body.contentId) {
+      if (controller.signal.aborted) throw Object.assign(new Error('操作已取消'), { code: 'ABORTED', status: 499 });
       const selectedTitle = output.result.titleCandidates?.[output.result.selectedTitleIndex || 0];
       const saved = await saveContent({
         id: request.body.contentId,
