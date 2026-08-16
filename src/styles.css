@@ -670,6 +670,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
   .top-command { height: 52px; grid-template-columns: minmax(0,1fr) auto; }
   .brand-block { display: none; }
   .project-identity { padding-left: 8px; }
+  .top-command .mobile-menu.arco-btn, .top-actions .arco-btn { width: 44px; height: 44px; min-width: 44px; min-height: 44px; }
   .top-actions .arco-btn:last-child { display: none; }
   .assistant-workspace { padding-top: 52px; }
   .assistant-shell.is-empty .conversation { place-items: start center; padding-top: 44px; }
@@ -734,11 +735,13 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
   .composer-wrap { width: 100%; padding: 8px 10px; }
   .content-sender .ant-sender-content { padding-right: 12px; padding-left: 12px; }
   .content-sender .ant-sender-footer { padding-left: 7px; }
+  .content-sender .ant-sender-actions-btn { width: 44px; height: 44px; min-width: 44px; }
   .sender-controls { gap: 2px; }
-  .sender-tool-button.attach-button { width: 32px; padding: 0; }
+  .sender-tool-button.ant-btn { min-height: 44px; }
+  .sender-tool-button.attach-button { width: 44px; padding: 0; }
   .sender-tool-button.attach-button > span:not(.ant-btn-icon) { display: none; }
   .platform-trigger.ant-btn { padding: 0 7px; gap: 5px; }
-  .expression-mode-trigger.ant-btn { max-width: 170px; padding-right: 6px; padding-left: 6px; }
+  .expression-mode-trigger.ant-btn { max-width: 145px; padding-right: 6px; padding-left: 6px; }
   .platform-feel-options.arco-radio-group { grid-template-columns: 1fr 1fr; }
   .material-modes { grid-template-columns: 1fr; }
   .upload-zone { min-height: 180px; }
