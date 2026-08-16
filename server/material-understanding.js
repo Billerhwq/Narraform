@@ -259,30 +259,36 @@ function createQueuedInput(input) {
 }
 
 export async function queueMaterialSetItems(materialSetId, { files = [], items = [] } = {}) {
-  const set = await getEntity('materialSets', materialSetId, 'materialSetId');
-  if (!set) throw materialError('MATERIAL_SET_NOT_FOUND', '没有找到这组创作资料', 404);
-  if (set.items.length + files.length + items.length > MAX_ITEMS) throw materialError('MATERIAL_LIMIT_EXCEEDED', '一组资料最多包含 20 项');
+  const existingSet = await getEntity('materialSets', materialSetId, 'materialSetId');
+  if (!existingSet) throw materialError('MATERIAL_SET_NOT_FOUND', '没有找到这组创作资料', 404);
   const candidates = [];
-  for (const file of files) candidates.push(await createQueuedFile(set, file));
+  for (const file of files) candidates.push(await createQueuedFile(existingSet, file));
   for (const input of items) candidates.push(createQueuedInput(input));
-  const knownHashes = new Set(set.items.map((item) => item.contentHash).filter(Boolean));
   const queued = [];
   const duplicates = [];
-  for (const item of candidates) {
-    if (item.contentHash && knownHashes.has(item.contentHash)) {
-      duplicates.push(item);
-      if (item.storagePath) await removeMaterialAsset(item.storagePath);
-      continue;
+  const set = await updateEntity('materialSets', materialSetId, async (latest) => {
+    if (latest.items.length + candidates.length > MAX_ITEMS) {
+      await Promise.all(candidates.filter((item) => item.storagePath).map((item) => removeMaterialAsset(item.storagePath)));
+      throw materialError('MATERIAL_LIMIT_EXCEEDED', '一组资料最多包含 20 项');
     }
-    knownHashes.add(item.contentHash);
-    queued.push(item);
-  }
-  set.items.push(...queued);
-  set.revision += 1;
-  set.updatedAt = now();
-  set.analysis = buildAnalysis(set);
-  set.status = set.analysis.status;
-  await putEntity('materialSets', set, 'materialSetId');
+    const knownHashes = new Set(latest.items.map((item) => item.contentHash).filter(Boolean));
+    for (const item of candidates) {
+      if (item.contentHash && knownHashes.has(item.contentHash)) {
+        duplicates.push(item);
+        if (item.storagePath) await removeMaterialAsset(item.storagePath);
+        continue;
+      }
+      knownHashes.add(item.contentHash);
+      queued.push(item);
+    }
+    latest.items.push(...queued);
+    latest.revision += 1;
+    latest.updatedAt = now();
+    latest.analysis = buildAnalysis(latest);
+    latest.status = latest.analysis.status;
+    return latest;
+  }, 'materialSetId');
+  if (!set) throw materialError('MATERIAL_SET_NOT_FOUND', '没有找到这组创作资料', 404);
   if (!queued.length) return { materialSet: publicMaterialSet(set), job: null, queued: [], duplicates: duplicates.map(publicItem) };
   const job = {
     jobId: `matjob_${crypto.randomUUID()}`,
@@ -320,26 +326,36 @@ export async function runMaterialAnalysisJob(jobId, { visionClient = defaultVisi
     if (!set) { job.status = 'cancelled'; break; }
     const index = set.items.findIndex((item) => item.sourceId === sourceId);
     if (index < 0 || ['ready', 'partial'].includes(set.items[index].status)) continue;
-    set.items[index].status = 'processing'; set.updatedAt = now(); set.analysis = buildAnalysis(set); set.status = set.analysis.status;
-    await putEntity('materialSets', set, 'materialSetId');
+    set = await updateEntity('materialSets', job.materialSetId, (latest) => {
+      const current = latest.items.find((item) => item.sourceId === sourceId);
+      if (current && !['ready', 'partial'].includes(current.status)) current.status = 'processing';
+      latest.updatedAt = now(); latest.analysis = buildAnalysis(latest); latest.status = latest.analysis.status;
+      return latest;
+    }, 'materialSetId');
+    if (!set) { job.status = 'cancelled'; break; }
+    const processingItem = set.items.find((item) => item.sourceId === sourceId);
+    if (!processingItem || ['ready', 'partial'].includes(processingItem.status)) continue;
     job.events.push({ type: 'item.parsing', sourceId, at: now() });
     try {
-      const parsed = await processQueuedMaterialItem(set, set.items[index], visionClient);
-      set = await getEntity('materialSets', job.materialSetId, 'materialSetId');
+      const parsed = await processQueuedMaterialItem(set, processingItem, visionClient);
+      set = await updateEntity('materialSets', job.materialSetId, (latest) => {
+        const currentIndex = latest.items.findIndex((item) => item.sourceId === sourceId);
+        if (currentIndex >= 0) latest.items[currentIndex] = parsed;
+        latest.revision += 1; latest.updatedAt = now(); latest.analysis = buildAnalysis(latest); latest.status = latest.analysis.status;
+        return latest;
+      }, 'materialSetId');
       if (!set) { job.status = 'cancelled'; break; }
-      const currentIndex = set.items.findIndex((item) => item.sourceId === sourceId);
-      if (currentIndex < 0) continue;
-      set.items[currentIndex] = parsed;
       job.events.push({ type: parsed.status === 'ready' ? 'item.ready' : 'item.partial', sourceId, at: now() });
     } catch (error) {
-      set = await getEntity('materialSets', job.materialSetId, 'materialSetId');
+      set = await updateEntity('materialSets', job.materialSetId, (latest) => {
+        const current = latest.items.find((item) => item.sourceId === sourceId);
+        if (current) { current.status = 'failed'; current.errorCode = error.code || 'MATERIAL_PARSE_FAILED'; current.error = error.message; }
+        latest.revision += 1; latest.updatedAt = now(); latest.analysis = buildAnalysis(latest); latest.status = latest.analysis.status;
+        return latest;
+      }, 'materialSetId');
       if (!set) { job.status = 'cancelled'; break; }
-      const current = set.items.find((item) => item.sourceId === sourceId);
-      if (current) { current.status = 'failed'; current.errorCode = error.code || 'MATERIAL_PARSE_FAILED'; current.error = error.message; }
       job.events.push({ type: 'item.failed', sourceId, code: error.code || 'MATERIAL_PARSE_FAILED', at: now() });
     }
-    set.revision += 1; set.updatedAt = now(); set.analysis = buildAnalysis(set); set.status = set.analysis.status;
-    await putEntity('materialSets', set, 'materialSetId');
     job.updatedAt = now(); await putEntity('materialAnalysisJobs', job, 'jobId');
   }
   if (job.status !== 'cancelled') {

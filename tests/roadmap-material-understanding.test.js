@@ -148,6 +148,27 @@ test('PR-02 素材任务先持久排队，后台完成并保留逐项事件', as
   assert.equal(eventPage.nextCursor, completed.events.length);
 });
 
+test('PR-02 连续添加文字和图片时不会用旧快照覆盖已完成素材', async () => {
+  const created = await createMaterialSet();
+  const text = await queueMaterialSetItems(created.materialSetId, {
+    items: [{ type: 'user_text', text: 'CodeLoop 可以读取用户授权的代码仓库，并运行项目测试。' }],
+  });
+  const image = await queueMaterialSetItems(created.materialSetId, {
+    files: [{ originalname: 'run.png', mimetype: 'image/png', size: 32, buffer: pngBuffer() }],
+  });
+
+  await Promise.all([
+    waitForMaterialAnalysis(text.job.jobId),
+    waitForMaterialAnalysis(image.job.jobId),
+  ]);
+
+  const materialSet = await getMaterialSet(created.materialSetId);
+  assert.deepEqual(materialSet.items.map((item) => item.status).sort(), ['partial', 'ready']);
+  assert.equal(materialSet.status, 'partial');
+  assert.equal(materialSet.analysis.userClaims.length, 1);
+  assert.match(materialSet.analysis.unknowns.join(' '), /没有配置图片理解模型/);
+});
+
 test('PR-02 相同素材去重，失败项可单独重试和删除', async () => {
   const created = await createMaterialSet();
   const first = await queueMaterialSetItems(created.materialSetId, { items: [{ type: 'user_text', text: '一段足够长且可以提取为事实的产品说明内容。' }] });
