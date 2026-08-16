@@ -234,6 +234,30 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, [role="button
 .review-callout { min-height: 220px; display: grid; place-content: center; justify-items: center; gap: 8px; color: #7c8694; text-align: center; }.review-callout > svg { font-size: 25px; color: var(--brand); }.review-callout strong { color: #303845; font-size: 12px; }.review-callout span { max-width: 250px; font-size: 9px; line-height: 1.55; }.causality-note { margin-top: 10px; display: flex; gap: 6px; color: #9aa2ae; font-size: 8px; line-height: 1.45; }.causality-note svg { flex: 0 0 auto; }
 .metric-form { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }.metric-form .arco-alert { grid-column: 1 / -1; }.metric-form label > span { display: block; margin-bottom: 5px; color: #5e6875; font-size: 10px; }
 
+/* Dense evidence stays compact without dropping below a readable metadata size. */
+.roadmap-workspace small,
+.roadmap-workspace .roadmap-page-heading p,
+.roadmap-workspace .roadmap-page-heading > div:first-child > span,
+.roadmap-workspace .material-block-heading > div > span,
+.roadmap-workspace .trace-status,
+.roadmap-workspace .evidence-group-title,
+.roadmap-workspace .evidence-row strong,
+.roadmap-workspace .text-source-preview,
+.roadmap-workspace .selected-evidence-detail > span,
+.roadmap-workspace .selected-evidence-detail p,
+.roadmap-workspace .evidence-locator,
+.roadmap-workspace .confidence-line,
+.roadmap-workspace .preview-guidance,
+.roadmap-workspace .unknown-facts,
+.roadmap-workspace .publish-config-bar label,
+.roadmap-workspace .publish-config-bar > span,
+.roadmap-workspace .package-field > label,
+.roadmap-workspace .preflight-check,
+.roadmap-workspace .preflight-placeholder { font-size: 12px; }
+.roadmap-workspace .delivery-platforms h3,
+.roadmap-workspace .preflight-column h3 { font-size: 13px; }
+.roadmap-workspace .package-body { font-size: 14px; line-height: 1.75; }
+
 @media (max-width: 1120px) {
   .material-workbench, .review-workbench { grid-template-columns: minmax(560px,1fr) 310px; }
   .delivery-workbench { grid-template-columns: 205px minmax(460px,1fr) 265px; }
