@@ -12,9 +12,12 @@ import { deleteContent, getContent, getContentVersions, getMaterials, getTask, l
 import { executeContentOperation } from './operation-engine.js';
 import { getPublicOperationSpecs } from './operation-specs.js';
 import { hashContent } from './change-set.js';
+import { applyLearningRules } from './strategy-engine.js';
 import { getPublicXhsFormatting, normalizeXhsFormattingOverride, resolveXhsFormattingProfile } from './xhs-formatting.js';
 import { createMaterialSet, deleteMaterialItem, deleteMaterialSet, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialAnalysisJob, getMaterialAsset, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, resolveMaterialConflicts, resumePendingMaterialAnalysisJobs, retryMaterialItem, updateMaterialFact } from './material-understanding.js';
+import { resetRoadmapStore } from './roadmap-store.js';
 import { cancelDeliveryJob, createDeliveryJob, createPublishPackages, deleteDeliveryForContent, deleteDeliveryReceipt, getDeliveryJob, getDeliveryReceipt, getPlatformSession, getPublishPackage, listDeliveryJobs, listDeliveryReceipts, listPublishPackages, preflightPublishPackage, resumePendingDeliveryJobs, retryDeliveryJob, startPlatformLogin } from './publish-delivery.js';
+import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getStrategyContext, listContentPerformance, listLearningRules, syncPerformanceSnapshot, updateLearningRule } from './performance-learning.js';
 import { listRuntimeEvents } from './adapter-runtime.js';
 
 const app = express();
@@ -164,11 +167,13 @@ app.post('/api/tasks/understand', async (request, response, next) => {
       factSet: materialSet ? factSetFromMaterialSet(materialSet) : null,
     });
     if (materialSet) taskBrief.materialSetId = materialSet.materialSetId;
-    await saveTask(taskBrief);
+    const learningRules = await getStrategyContext({ platform: taskBrief.platform, contentType: taskBrief.contentType });
+    const taskWithLearning = applyLearningRules(taskBrief, learningRules, request.body.excludedLearningRuleIds || []);
+    await saveTask(taskWithLearning);
     response.status(201).json({
-      status: taskBrief.status,
-      taskBrief: publicTaskBrief(taskBrief),
-      questions: taskBrief.questions,
+      status: taskWithLearning.status,
+      taskBrief: publicTaskBrief(taskWithLearning),
+      questions: taskWithLearning.questions,
       factCount: factSet.verifiedFacts.length,
     });
   } catch (error) { next(error); }
@@ -179,6 +184,24 @@ app.post('/api/tasks/:taskId/select-strategy', async (request, response, next) =
     const taskBrief = await selectTaskStrategy(request.params.taskId, request.body.strategyId);
     if (!taskBrief) return response.status(404).json({ error: '没有找到对应任务或策略' });
     response.json({ status: taskBrief.status, taskBrief: publicTaskBrief(taskBrief) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/tasks/:taskId/learning-rules/:ruleId', async (request, response, next) => {
+  try {
+    const taskBrief = await getTask(request.params.taskId);
+    if (!taskBrief) return response.status(404).json({ code: 'TASK_NOT_FOUND', error: '没有找到对应创作任务' });
+    const availableRules = await getStrategyContext({ platform: taskBrief.platform, contentType: taskBrief.contentType });
+    if (!availableRules.some((rule) => rule.ruleId === request.params.ruleId)) {
+      return response.status(404).json({ code: 'LEARNING_RULE_NOT_FOUND', error: '这条创作经验已失效或不适用于当前任务' });
+    }
+    const excluded = new Set(taskBrief.excludedLearningRuleIds || []);
+    if (request.body.enabled === false) excluded.add(request.params.ruleId); else excluded.delete(request.params.ruleId);
+    const updated = applyLearningRules(taskBrief, availableRules, [...excluded]);
+    updated.selectedStrategyId = null;
+    updated.status = updated.questions?.length ? 'needs_input' : 'awaiting_strategy';
+    await saveTask(updated);
+    response.json({ status: updated.status, taskBrief: publicTaskBrief(updated) });
   } catch (error) { next(error); }
 });
 
@@ -396,7 +419,7 @@ app.patch('/api/contents/:id', async (request, response, next) => {
 app.delete('/api/contents/:id', async (request, response, next) => {
   try {
     if (!(await deleteContent(request.params.id))) return response.status(404).json({ error: '没有找到这条内容记录' });
-    await deleteDeliveryForContent(request.params.id);
+    await Promise.all([deletePerformanceForContent(request.params.id), deleteDeliveryForContent(request.params.id)]);
     response.status(204).end();
   } catch (error) { next(error); }
 });
@@ -464,12 +487,52 @@ app.get('/api/delivery-receipts/:id', async (request, response, next) => {
 });
 app.delete('/api/delivery-receipts/:id', async (request, response, next) => {
   try {
-    if (!(await deleteDeliveryReceipt(request.params.id))) return response.status(404).json({ code: 'DELIVERY_RECEIPT_NOT_FOUND', error: '没有找到送达回执' });
+    const receipt = await getDeliveryReceipt(request.params.id);
+    if (!receipt) return response.status(404).json({ code: 'DELIVERY_RECEIPT_NOT_FOUND', error: '没有找到送达回执' });
+    await deletePerformanceByReceipt(request.params.id);
+    await deleteDeliveryReceipt(request.params.id);
     response.status(204).end();
   } catch (error) { next(error); }
 });
 
-if (process.env.NODE_ENV === 'test') app.post('/api/test/reset', async (_request, response) => { await resetStore(); response.status(204).end(); });
+app.post('/api/performance-snapshots', async (request, response, next) => {
+  try { response.status(201).json({ snapshot: await createPerformanceSnapshot(request.body) }); } catch (error) { next(error); }
+});
+app.post('/api/performance-snapshots/import', async (request, response, next) => {
+  try { response.status(201).json({ snapshot: await createPerformanceSnapshot(request.body) }); } catch (error) { next(error); }
+});
+app.post('/api/performance-snapshots/sync', async (request, response, next) => {
+  try { response.status(201).json({ snapshot: await syncPerformanceSnapshot(request.body) }); } catch (error) { next(error); }
+});
+app.get('/api/contents/:id/performance', async (request, response, next) => {
+  try { response.json({ snapshots: await listContentPerformance(request.params.id) }); } catch (error) { next(error); }
+});
+app.delete('/api/performance-snapshots/:id', async (request, response, next) => {
+  try {
+    if (!(await deletePerformanceSnapshot(request.params.id))) return response.status(404).json({ code: 'PERFORMANCE_SNAPSHOT_NOT_FOUND', error: '没有找到表现快照' });
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+app.post('/api/contents/:id/retrospective', async (request, response, next) => {
+  try { response.json(await generateRetrospective(request.params.id, request.body.snapshotId || null)); } catch (error) { next(error); }
+});
+app.get('/api/learning-rules', async (_request, response, next) => {
+  try { response.json({ rules: await listLearningRules() }); } catch (error) { next(error); }
+});
+app.post('/api/learning-rules/:id/approve', async (request, response, next) => {
+  try { response.status(201).json({ rule: await approveInsight(request.params.id) }); } catch (error) { next(error); }
+});
+app.post('/api/learning-rules/:id/dismiss', async (request, response, next) => {
+  try { response.json({ insight: await dismissInsight(request.params.id) }); } catch (error) { next(error); }
+});
+app.patch('/api/learning-rules/:id', async (request, response, next) => {
+  try { response.json({ rule: await updateLearningRule(request.params.id, request.body) }); } catch (error) { next(error); }
+});
+app.get('/api/strategy-context', async (request, response, next) => {
+  try { response.json({ rules: await getStrategyContext(request.query) }); } catch (error) { next(error); }
+});
+
+if (process.env.NODE_ENV === 'test') app.post('/api/test/reset', async (_request, response) => { await resetStore(); await resetRoadmapStore(); response.status(204).end(); });
 
 function publicError(error) {
   const known = new Set(['TASK_NOT_FOUND', 'CONTENT_STALE', 'CONTENT_REVISION_CONFLICT', 'CONTENT_NOT_FOUND', 'VERSION_NOT_FOUND', 'INVALID_OPERATION', 'INVALID_SCOPE', 'ABORTED']);
