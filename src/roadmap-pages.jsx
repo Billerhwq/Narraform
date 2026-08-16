@@ -244,7 +244,7 @@ async function exportPublishPackages(packages) {
   URL.revokeObjectURL(url);
 }
 
-export function PublishWorkspace({ materialSetId }) {
+export function PublishWorkspace() {
   const [contents, setContents] = useState([]);
   const [contentId, setContentId] = useState('');
   const [platforms, setPlatforms] = useState(['xiaohongshu']);
@@ -253,14 +253,13 @@ export function PublishWorkspace({ materialSetId }) {
   const [job, setJob] = useState(null);
   const [activePlatform, setActivePlatform] = useState('xiaohongshu');
   const [loading, setLoading] = useState(false);
-  const [materialSet, setMaterialSet] = useState(null);
   const [loginStarting, setLoginStarting] = useState(false);
 
   useEffect(() => {
-    Promise.all([request('/api/contents'), materialSetId ? request(`/api/material-sets/${materialSetId}`).catch(() => null) : null]).then(([contentData, materialData]) => {
-      setContents(contentData.contents || []); setContentId(contentData.contents?.[0]?.id || ''); setMaterialSet(materialData?.materialSet || null);
+    request('/api/contents').then((contentData) => {
+      setContents(contentData.contents || []); setContentId(contentData.contents?.[0]?.id || '');
     }).catch((error) => Message.error(error.message));
-  }, [materialSetId]);
+  }, []);
 
   useEffect(() => {
     if (!job || !['queued', 'created', 'running'].includes(job.status)) return undefined;
@@ -285,8 +284,7 @@ export function PublishWorkspace({ materialSetId }) {
     if (!contentId) return Message.info('请先完成并保存一篇内容');
     setLoading(true); setJob(null);
     try {
-      const assets = (materialSet?.items || []).filter((item) => item.type === 'image').map((item, index) => ({ assetId: item.sourceId, type: 'image', role: index === 0 ? 'cover' : 'content', order: index + 1, sourceUrl: `/api/material-sets/${materialSet.materialSetId}/items/${item.sourceId}/asset`, sha256: item.contentHash, altText: item.name }));
-      const data = await request('/api/publish-packages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId, contentRevision: selectedContent.revision, platforms, target: 'draft', assets }) });
+      const data = await request('/api/publish-packages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ contentId, contentRevision: selectedContent.revision, platforms, target: 'draft' }) });
       const checks = {};
       for (const pkg of data.packages) checks[pkg.packageId] = (await request(`/api/publish-packages/${pkg.packageId}/preflight`, { method: 'POST' })).preflight;
       setPackages(data.packages); setPreflights(checks);

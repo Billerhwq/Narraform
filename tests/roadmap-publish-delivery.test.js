@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { resetStore, saveContent } from '../server/store.js';
 import { resetRoadmapStore } from '../server/roadmap-store.js';
-import { cancelDeliveryJob, createDeliveryJob, createPublishPackages, createSandboxDraftAdapter, deleteDeliveryForContent, getDeliveryJob, getDeliveryReceipt, listDeliveryJobs, listPublishPackages, preflightPublishPackage, retryDeliveryJob, waitForDeliveryJob } from '../server/publish-delivery.js';
+import { cancelDeliveryJob, createDeliveryJob, createPublishPackages, createSandboxDraftAdapter, createWebhookAdapter, deleteDeliveryForContent, getDeliveryJob, getDeliveryReceipt, listDeliveryJobs, listPublishPackages, preflightPublishPackage, retryDeliveryJob, waitForDeliveryJob } from '../server/publish-delivery.js';
+import { addMaterialSetItems, createMaterialSet } from '../server/material-understanding.js';
 
 test.beforeEach(async () => { await resetStore(); await resetRoadmapStore(); });
 
@@ -35,6 +36,29 @@ test('PR-03 发布包绑定不可变内容版本并执行平台 preflight', asyn
 
   const [withoutImage] = await createPublishPackages({ contentId: content.id, contentRevision: 1, platforms: ['xiaohongshu'] });
   assert.equal((await preflightPublishPackage(withoutImage)).status, 'blocked');
+});
+
+test('PR-03 发布包默认只使用所选内容绑定的素材集', async () => {
+  const firstSet = await createMaterialSet();
+  const secondSet = await createMaterialSet();
+  await addMaterialSetItems(firstSet.materialSetId, {
+    files: [{ originalname: 'selected.png', mimetype: 'image/png', size: 32, buffer: Buffer.alloc(32) }],
+    visionClient: async () => ({ status: 'analysis_unavailable', observations: [], unknowns: [] }),
+  });
+  await addMaterialSetItems(secondSet.materialSetId, {
+    files: [{ originalname: 'unrelated.png', mimetype: 'image/png', size: 32, buffer: Buffer.alloc(32) }],
+    visionClient: async () => ({ status: 'analysis_unavailable', observations: [], unknowns: [] }),
+  });
+  const content = await saveContent({
+    name: '绑定素材的内容', platform: 'xiaohongshu', materialSetId: firstSet.materialSetId,
+    titleCandidates: ['绑定素材'], bodyMarkdown: '只应使用这篇内容自己的图片。', topics: [],
+  });
+  const [pkg] = await createPublishPackages({ contentId: content.id, platforms: ['xiaohongshu'] });
+  assert.equal(pkg.materialSetId, firstSet.materialSetId);
+  assert.equal(pkg.assets.length, 1);
+  assert.equal(pkg.assets[0].altText, 'selected.png');
+  assert.match(pkg.assets[0].sourceUrl, new RegExp(firstSet.materialSetId));
+  assert.doesNotMatch(pkg.assets[0].sourceUrl, new RegExp(secondSet.materialSetId));
 });
 
 test('PR-03 跨平台发布包经过内容引擎适配而不是直接复制字段', async () => {
@@ -107,7 +131,7 @@ test('PR-03 第三张素材失败后从检查点继续，不重传已确认资�
       assert.equal(deliveryPackage.assets.every((asset) => asset.remoteAsset?.remoteAssetId), true);
       return { remoteDraftId: 'draft_resume_1' };
     },
-    verify: async () => ({ verified: true, verificationMethod: 'draft_list_lookup' }),
+    verify: async (submitted) => ({ verified: true, verificationMethod: 'draft_list_lookup', lookupEvidence: { matched: true, remoteDraftId: submitted.remoteDraftId } }),
   };
   const queued = await createDeliveryJob([pkg.packageId], { adapterResolver: () => adapter });
   const failed = await waitForDeliveryJob(queued.jobId, { adapterResolver: () => adapter });
@@ -131,7 +155,7 @@ test('PR-03 取消正在提交的任务会中断连接器，且后台不会覆�
       startedResolve();
       signal.addEventListener('abort', () => reject(Object.assign(new Error('已取消'), { name: 'AbortError' })), { once: true });
     }),
-    verify: async () => ({ verified: true, verificationMethod: 'draft_list_lookup' }),
+    verify: async () => ({ verified: true, verificationMethod: 'draft_list_lookup', lookupEvidence: { matched: true, remoteDraftId: 'cancelled' } }),
   };
   const queued = await createDeliveryJob([pkg.packageId], { adapterResolver: () => adapter });
   await started;
@@ -154,6 +178,66 @@ test('PR-03 未配置生产连接器时不伪造平台送达成功', async () =>
   assert.match(job.items[0].userMessage, /没有可用的平台连接器/);
 });
 
+test('PR-03 连接器仅声明 verified 但没有可核验远端依据时保持 uncertain', async () => {
+  const content = await codeLoopContent();
+  const [pkg] = await createPublishPackages({ contentId: content.id, platforms: ['xiaohongshu'], assets: [{ assetId: 'cover', type: 'image' }] });
+  const adapter = {
+    capabilities: async () => ({ draft: true, directPublish: false, verifyDraft: true, requiresSession: false }),
+    checkSession: async () => ({ status: 'ready' }),
+    createDraft: async () => ({}),
+    verify: async () => ({ verified: true, verificationMethod: 'made_up_lookup' }),
+  };
+  const queued = await createDeliveryJob([pkg.packageId], { adapterResolver: () => adapter });
+  const job = await waitForDeliveryJob(queued.jobId, { adapterResolver: () => adapter });
+  const receipt = await getDeliveryReceipt(job.items[0].receiptId);
+  assert.equal(job.status, 'uncertain');
+  assert.equal(receipt.verified, false);
+  assert.equal(receipt.verificationMethod, null);
+  assert.equal(receipt.remoteDraftId, null);
+});
+
+test('PR-03 提交时间在远端验证开始前即被记录', async () => {
+  const content = await codeLoopContent();
+  const [pkg] = await createPublishPackages({ contentId: content.id, platforms: ['xiaohongshu'], assets: [{ assetId: 'cover', type: 'image' }] });
+  let verificationStartedAt;
+  const adapter = {
+    capabilities: async () => ({ draft: true, directPublish: false, verifyDraft: true, requiresSession: false }),
+    checkSession: async () => ({ status: 'ready' }),
+    createDraft: async () => ({ remoteDraftId: 'draft_timestamp' }),
+    verify: async () => {
+      verificationStartedAt = new Date().toISOString();
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      return { verified: true, verificationMethod: 'api_response' };
+    },
+  };
+  const queued = await createDeliveryJob([pkg.packageId], { adapterResolver: () => adapter });
+  const job = await waitForDeliveryJob(queued.jobId, { adapterResolver: () => adapter });
+  const receipt = await getDeliveryReceipt(job.items[0].receiptId);
+  assert.ok(receipt.submittedAt <= verificationStartedAt);
+  assert.ok(receipt.verifiedAt > receipt.submittedAt);
+});
+
+test('PR-03 Webhook 能力与会话请求始终携带目标平台', async () => {
+  const previousUrl = process.env.NARRAFORM_DELIVERY_ADAPTER_URL;
+  const previousFetch = globalThis.fetch;
+  process.env.NARRAFORM_DELIVERY_ADAPTER_URL = 'https://connector.example.test';
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return { ok: true, json: async () => ({ status: 'ready', draft: true }) };
+  };
+  try {
+    const adapter = createWebhookAdapter();
+    await adapter.capabilities('zhihu');
+    await adapter.checkSession('wechat');
+    assert.deepEqual(calls.map((call) => call.body), [{ platform: 'zhihu' }, { platform: 'wechat' }]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousUrl === undefined) delete process.env.NARRAFORM_DELIVERY_ADAPTER_URL;
+    else process.env.NARRAFORM_DELIVERY_ADAPTER_URL = previousUrl;
+  }
+});
+
 test('PR-03 直接发布必须二次确认且适配器明确支持', async () => {
   const content = await codeLoopContent();
   await assert.rejects(
@@ -174,8 +258,8 @@ test('PR-03 直接发布必须二次确认且适配器明确支持', async () =>
   const adapter = {
     capabilities: async () => ({ draft: true, directPublish: true, verifyDraft: true, requiresSession: false }),
     checkSession: async () => ({ status: 'ready' }),
-    publish: async () => { publishCalls += 1; return { remoteDraftId: 'published_01', adapterVersion: 'test-direct-1' }; },
-    verify: async () => ({ verified: true, verificationMethod: 'url_lookup' }),
+    publish: async () => { publishCalls += 1; return { remoteUrl: 'https://platform.example.test/published/01', adapterVersion: 'test-direct-1' }; },
+    verify: async (submitted) => ({ verified: true, verificationMethod: 'url_lookup', lookupEvidence: { matched: true, remoteUrl: submitted.remoteUrl } }),
   };
   const queued = await createDeliveryJob([pkg.packageId], { adapterResolver: () => adapter });
   const job = await waitForDeliveryJob(queued.jobId, { adapterResolver: () => adapter });

@@ -6,6 +6,7 @@ import { deleteEntity, getEntity, listEntities, putEntity, updateEntity } from '
 import { resolvePlatformSpec } from './platform-specs.js';
 import { buildFactSet, modifyCopy } from './content-engine.js';
 import { runAdapterOperation } from './adapter-runtime.js';
+import { getMaterialSetInternal } from './material-understanding.js';
 
 const SUPPORTED_PLATFORMS = new Set(['xiaohongshu', 'zhihu', 'wechat']);
 const PLATFORM_LABELS = { xiaohongshu: '小红书', zhihu: '知乎', wechat: '微信公众号' };
@@ -32,7 +33,23 @@ function fieldsForPlatform(platform, version, override = {}) {
   return { title, digest: override.digest ?? version.summary ?? '', body, author: override.author || '' };
 }
 
-export async function createPublishPackages({ contentId, contentRevision, platforms = [], target = 'draft', directPublishConfirmed = false, overrides = {}, assets = [] }) {
+async function resolveContentAssets(content, assets) {
+  if (Array.isArray(assets)) return assets;
+  if (!content.materialSetId) return [];
+  const materialSet = await getMaterialSetInternal(content.materialSetId);
+  if (!materialSet) return [];
+  return materialSet.items.filter((item) => item.type === 'image').map((item, index) => ({
+    assetId: item.sourceId,
+    type: 'image',
+    role: index === 0 ? 'cover' : 'content',
+    order: index + 1,
+    sourceUrl: `/api/material-sets/${materialSet.materialSetId}/items/${item.sourceId}/asset`,
+    sha256: item.contentHash,
+    altText: item.name,
+  }));
+}
+
+export async function createPublishPackages({ contentId, contentRevision, platforms = [], target = 'draft', directPublishConfirmed = false, overrides = {}, assets = null }) {
   if (target !== 'draft' && target !== 'published') throw deliveryError('PUBLISH_TARGET_UNSUPPORTED', '发布目标只能是草稿或直接发布');
   if (target === 'published' && directPublishConfirmed !== true) throw deliveryError('DIRECT_PUBLISH_CONFIRMATION_REQUIRED', '直接发布需要再次明确确认', 409);
   const content = await getContent(contentId);
@@ -44,6 +61,7 @@ export async function createPublishPackages({ contentId, contentRevision, platfo
   if (requestedPlatforms.some((platform) => !SUPPORTED_PLATFORMS.has(platform))) throw deliveryError('PLATFORM_UNSUPPORTED', '当前只支持小红书、知乎和微信公众号发布包');
   const createdAt = now();
   const packages = [];
+  const resolvedAssets = await resolveContentAssets(content, assets);
   const taskBrief = version.taskId ? await getTask(version.taskId) : null;
   for (const platform of requestedPlatforms) {
     let platformVersion = version;
@@ -75,12 +93,13 @@ export async function createPublishPackages({ contentId, contentRevision, platfo
       packageId: `pkg_${crypto.randomUUID()}`,
       contentId,
       contentRevision: revision,
+      materialSetId: content.materialSetId || null,
       platform,
       platformLabel: PLATFORM_LABELS[platform],
       target,
       directPublishConfirmed: target === 'published',
       fields: fieldsForPlatform(platform, platformVersion, overrides[platform] || {}),
-      assets: assets.filter((asset) => !asset.platform || asset.platform === platform).map((asset, index) => ({ ...asset, order: asset.order || index + 1 })),
+      assets: resolvedAssets.filter((asset) => !asset.platform || asset.platform === platform).map((asset, index) => ({ ...asset, order: asset.order || index + 1 })),
       platformSpecVersion: platformVersion.platformSpecVersion || platformVersion.specVersion || resolvePlatformSpec(platform, mode).version,
       adaptation,
       createdAt,
@@ -159,13 +178,13 @@ export function createSandboxDraftAdapter(directory = path.resolve('.test-data',
       return { remoteDraftId, path: file, idempotentReplay: false };
     },
     verify: async (result) => {
-      try { await fs.access(result.path); return { verified: true, verificationMethod: 'sandbox_draft_list_lookup' }; }
+      try { await fs.access(result.path); return { verified: true, verificationMethod: 'sandbox_draft_list_lookup', lookupEvidence: { matched: true, remoteDraftId: result.remoteDraftId } }; }
       catch { return { verified: false, verificationMethod: null }; }
     },
   };
 }
 
-function webhookAdapter() {
+export function createWebhookAdapter() {
   const endpoint = process.env.NARRAFORM_DELIVERY_ADAPTER_URL;
   const key = process.env.NARRAFORM_DELIVERY_ADAPTER_KEY;
   if (!endpoint) return null;
@@ -177,8 +196,8 @@ function webhookAdapter() {
     return response.json();
   };
   return {
-    capabilities: () => call('capabilities', {}),
-    checkSession: ({ signal } = {}) => call('session', {}, signal),
+    capabilities: (platform, { signal } = {}) => call('capabilities', { platform }, signal),
+    checkSession: (platform, { signal } = {}) => call('session', { platform }, signal),
     startLogin: (platform, { signal } = {}) => call('login', { platform }, signal),
     uploadAsset: (pkg, asset, keyValue, { signal } = {}) => call('assets', { packageId: pkg.packageId, platform: pkg.platform, asset, idempotencyKey: `${keyValue}:${asset.assetId}` }, signal),
     createDraft: (pkg, keyValue, context = {}) => call('drafts', { package: pkg, idempotencyKey: keyValue, checkpoint: context.checkpoint }, context.signal),
@@ -189,14 +208,14 @@ function webhookAdapter() {
 
 function defaultAdapter() {
   if (process.env.NARRAFORM_DELIVERY_MODE === 'sandbox' || process.env.NODE_ENV === 'test') return createSandboxDraftAdapter();
-  return webhookAdapter();
+  return createWebhookAdapter();
 }
 
 export async function getPlatformSession(platform) {
   if (!SUPPORTED_PLATFORMS.has(platform)) throw deliveryError('PLATFORM_UNSUPPORTED', '当前只支持小红书、知乎和微信公众号');
   const adapter = defaultAdapter();
   if (!adapter) return { platform, status: 'connector_required', message: '尚未配置平台连接器，可先导出内容包' };
-  return { platform, ...(await adapter.checkSession()) };
+  return { platform, ...(await adapter.checkSession(platform)) };
 }
 
 export async function startPlatformLogin(platform) {
@@ -214,6 +233,18 @@ function aggregateJobStatus(items) {
   if (items.some((item) => item.status === 'uncertain')) return 'uncertain';
   if (items.every((item) => item.status === 'preflight_failed' || item.status === 'failed')) return 'failed';
   return 'partial';
+}
+
+function isAcceptedVerification({ verification, verificationMethod, remoteDraftId, remoteUrl, lookupEvidence }) {
+  if (verification?.verified !== true) return false;
+  if (verificationMethod === 'api_response') return Boolean(remoteDraftId || remoteUrl);
+  if (verificationMethod === 'draft_list_lookup' || verificationMethod === 'sandbox_draft_list_lookup') {
+    return Boolean(remoteDraftId && lookupEvidence?.matched === true && (!lookupEvidence.remoteDraftId || lookupEvidence.remoteDraftId === remoteDraftId));
+  }
+  if (verificationMethod === 'url_lookup') {
+    return Boolean(remoteUrl && lookupEvidence?.matched === true && (!lookupEvidence.remoteUrl || lookupEvidence.remoteUrl === remoteUrl));
+  }
+  return false;
 }
 
 export async function createDeliveryJob(packageIds, { adapterResolver = defaultAdapter } = {}) {
@@ -243,7 +274,7 @@ async function deliverItem(job, item, adapterResolver, signal) {
   let capabilities;
   try {
     capabilities = adapter
-      ? await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'capabilities', execute: () => adapter.capabilities({ signal }) })
+      ? await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'capabilities', execute: () => adapter.capabilities(pkg.platform, { signal }) })
       : { draft: false, directPublish: false, verifyDraft: false, requiresSession: true };
   } catch (error) {
     if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
@@ -272,7 +303,7 @@ async function deliverItem(job, item, adapterResolver, signal) {
   let session;
   try {
     await assertDeliveryActive(job.jobId, signal);
-    session = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'check_session', adapterVersion, execute: () => adapter.checkSession({ signal }) });
+    session = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'check_session', adapterVersion, execute: () => adapter.checkSession(pkg.platform, { signal }) });
   } catch (error) {
     if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
       item.status = 'cancelled'; item.errorCode = 'DELIVERY_CANCELLED'; item.userMessage = '发布任务已取消';
@@ -320,12 +351,19 @@ async function deliverItem(job, item, adapterResolver, signal) {
         ? adapter.publish(packageForAdapter, idempotencyKey(pkg), { signal, checkpoint: item.checkpoint })
         : adapter.createDraft(packageForAdapter, idempotencyKey(pkg), { signal, checkpoint: item.checkpoint }),
     });
+    const submittedAt = now();
+    item.submittedAt = submittedAt;
     await assertDeliveryActive(job.jobId, signal);
     item.status = 'verifying';
     job.updatedAt = now();
     await putEntity('deliveryJobs', job, 'jobId');
     const verification = await runAdapterOperation({ adapterKey: `delivery:${pkg.platform}`, action: 'verify', adapterVersion, operationId: job.jobId, execute: () => adapter.verify(submitted, pkg, { signal }) });
     await assertDeliveryActive(job.jobId, signal);
+    const remoteDraftId = submitted.remoteDraftId || verification.remoteDraftId || null;
+    const remoteUrl = submitted.remoteUrl || verification.remoteUrl || null;
+    const verificationMethod = verification.verificationMethod || null;
+    const lookupEvidence = verification.lookupEvidence || null;
+    const verified = isAcceptedVerification({ verification, verificationMethod, remoteDraftId, remoteUrl, lookupEvidence });
     const receipt = {
       receiptId: `rcpt_${crypto.randomUUID()}`,
       jobId: job.jobId,
@@ -334,18 +372,19 @@ async function deliverItem(job, item, adapterResolver, signal) {
       contentRevision: pkg.contentRevision,
       platform: pkg.platform,
       target: pkg.target,
-      status: verification.verified ? 'delivered' : 'uncertain',
-      remoteDraftId: submitted.remoteDraftId || null,
-      remoteUrl: submitted.remoteUrl || null,
-      verified: Boolean(verification.verified),
-      verificationMethod: verification.verificationMethod || null,
-      submittedAt: now(),
-      verifiedAt: verification.verified ? now() : null,
+      status: verified ? 'delivered' : 'uncertain',
+      remoteDraftId,
+      remoteUrl,
+      verified,
+      verificationMethod: verified ? verificationMethod : null,
+      lookupEvidence: verified ? lookupEvidence : null,
+      submittedAt,
+      verifiedAt: verified ? now() : null,
       adapterVersion: submitted.adapterVersion || adapterVersion,
     };
     await putEntity('deliveryReceipts', receipt, 'receiptId');
     item.receiptId = receipt.receiptId; item.status = receipt.status;
-    job.events.push({ type: verification.verified ? 'delivery.delivered' : 'delivery.uncertain', platform: pkg.platform, receiptId: receipt.receiptId, at: now() });
+    job.events.push({ type: verified ? 'delivery.delivered' : 'delivery.uncertain', platform: pkg.platform, receiptId: receipt.receiptId, at: now() });
   } catch (error) {
     if (error.code === 'DELIVERY_CANCELLED' || error.name === 'AbortError') {
       item.status = 'cancelled'; item.errorCode = 'DELIVERY_CANCELLED'; item.userMessage = '发布任务已取消';
