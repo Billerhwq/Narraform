@@ -348,12 +348,14 @@ function App() {
   const contentRevisionRef = useRef(null);
   const persistQueue = useRef(Promise.resolve());
   const editRevision = useRef(0);
+  const [editEpoch, setEditEpoch] = useState(0);
   const legacyTopicRepairs = useRef(new Set());
   const operationController = useRef(null);
   const strategyRequestLock = useRef(false);
 
   const markDirty = () => {
     editRevision.current += 1;
+    setEditEpoch((current) => current + 1);
     setDirty(true);
     setAutosaveState('pending');
   };
@@ -668,7 +670,7 @@ function App() {
     clearTimeout(autosaveTimer.current);
     if (!result || !dirty || generating || activeOperation) return undefined;
     const revision = editRevision.current;
-    autosaveTimer.current = setTimeout(async () => {
+    const timer = setTimeout(async () => {
       setAutosaveState('saving');
       try {
         await persistCurrent('autosave');
@@ -681,8 +683,9 @@ function App() {
         setAutosaveState('error');
       }
     }, 500);
-    return () => clearTimeout(autosaveTimer.current);
-  }, [result, dirty, generating, activeOperation, platform, materials]);
+    autosaveTimer.current = timer;
+    return () => clearTimeout(timer);
+  }, [editEpoch, dirty, generating, activeOperation, platform, materials]);
 
   const loadContent = async (id) => {
     if (dirty) {

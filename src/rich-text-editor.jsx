@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { EditorContent, useEditor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import { Markdown } from '@tiptap/markdown';
@@ -11,6 +11,9 @@ import {
 
 export function RichTextEditor({ value, onChange, readOnly = false, streaming = false, onPolish }) {
   const [selection, setSelection] = useState(null);
+  const valueRef = useRef(value || '');
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
   const editor = useEditor({
     extensions: [
       StarterKit.configure({ heading: { levels: [1, 2] } }),
@@ -21,7 +24,12 @@ export function RichTextEditor({ value, onChange, readOnly = false, streaming = 
     contentType: 'markdown',
     editable: !readOnly,
     immediatelyRender: false,
-    onUpdate: ({ editor: current }) => onChange?.(current.getMarkdown()),
+    onUpdate: ({ editor: current }) => {
+      const markdown = current.getMarkdown();
+      if (markdown === valueRef.current) return;
+      valueRef.current = markdown;
+      onChangeRef.current?.(markdown);
+    },
     onSelectionUpdate: ({ editor: current }) => {
       if (readOnly) return setSelection(null);
       const { from, to } = current.state.selection;
@@ -36,8 +44,10 @@ export function RichTextEditor({ value, onChange, readOnly = false, streaming = 
   useEffect(() => {
     if (!editor) return;
     editor.setEditable(!readOnly);
+    const nextValue = value || '';
     const current = editor.getMarkdown();
-    if (current !== (value || '')) editor.commands.setContent(value || '', { contentType: 'markdown', emitUpdate: false });
+    valueRef.current = nextValue;
+    if (current !== nextValue) editor.commands.setContent(nextValue, { contentType: 'markdown', emitUpdate: false });
   }, [editor, value, readOnly]);
 
   if (!editor) return <div className="rich-editor-loading"><Spin size={18} /></div>;
