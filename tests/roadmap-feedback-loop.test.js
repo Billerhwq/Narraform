@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { deleteContent, resetStore, saveContent } from '../server/store.js';
 import { putEntity, resetRoadmapStore } from '../server/roadmap-store.js';
-import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getStrategyContext, listContentPerformance, listLearningRules, normalizeMetrics, syncPerformanceSnapshot } from '../server/performance-learning.js';
+import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getRetrospectiveState, getStrategyContext, listContentPerformance, listLearningRules, normalizeMetrics, syncPerformanceSnapshot } from '../server/performance-learning.js';
 
 test.beforeEach(async () => { await resetStore(); await resetRoadmapStore(); });
 
@@ -60,6 +60,10 @@ test('PR-04 绑定发布回执时按真实提交时间计算内容年龄', async
 test('PR-04 未绑定回执的时间必须有效，相同采集时点自动去重', async () => {
   const current = await content('快照去重内容');
   await assert.rejects(
+    () => createPerformanceSnapshot({ contentId: current.id, source: 'manual', metrics: { reads: 1 } }),
+    (error) => error.code === 'PERFORMANCE_AGE_INVALID',
+  );
+  await assert.rejects(
     () => createPerformanceSnapshot({ contentId: current.id, source: 'manual', ageHours: -1, metrics: { reads: 1 } }),
     (error) => error.code === 'PERFORMANCE_AGE_INVALID',
   );
@@ -69,6 +73,23 @@ test('PR-04 未绑定回执的时间必须有效，相同采集时点自动去�
   assert.equal(duplicate.snapshotId, first.snapshotId);
   assert.equal((await listContentPerformance(current.id)).length, 1);
   assert.equal(first.publicationLinkStatus, 'unlinked');
+});
+
+test('PR-04 无效采集时间和跨平台回执绑定会被拒绝', async () => {
+  const current = await content('时间与平台校验内容');
+  await assert.rejects(
+    () => createPerformanceSnapshot({ contentId: current.id, source: 'manual', ageHours: 12, capturedAt: 'not-a-date', metrics: { reads: 1 } }),
+    (error) => error.code === 'PERFORMANCE_CAPTURE_TIME_INVALID',
+  );
+  const receipt = {
+    receiptId: 'rcpt_platform_contract', contentId: current.id, contentRevision: 1,
+    platform: 'xiaohongshu', submittedAt: '2026-08-16T08:00:00.000Z', verified: true, status: 'delivered',
+  };
+  await putEntity('deliveryReceipts', receipt, 'receiptId');
+  await assert.rejects(
+    () => createPerformanceSnapshot({ contentId: current.id, receiptId: receipt.receiptId, platform: 'zhihu', capturedAt: '2026-08-17T08:00:00.000Z', source: 'manual', metrics: { reads: 1 } }),
+    (error) => error.code === 'PERFORMANCE_RECEIPT_PLATFORM_MISMATCH',
+  );
 });
 
 test('PR-04 样本少于 5 条时只返回数据，不生成趋势建议', async () => {
@@ -104,6 +125,25 @@ test('PR-04 同类基线产生证据化建议，批准后才进入策略上下�
   const context = await getStrategyContext({ platform: 'xiaohongshu', goal: 'save', contentType: 'product_marketing' });
   assert.equal(context.length, 1);
   assert.equal(context[0].sourceInsightId, result.insight.insightId);
+  const restored = await getRetrospectiveState(current.id);
+  assert.equal(restored.retrospective.insight.status, 'approved');
+  assert.equal(restored.rule.ruleId, rule.ruleId);
+  assert.equal(restored.rule.status, 'active');
+  assert.equal(restored.rule.rule, rule.rule);
+});
+
+test('PR-04 已批准洞察不能通过忽略接口绕过仍生效的学习规则', async () => {
+  const current = await content('批准状态一致性');
+  await createPerformanceSnapshot({ contentId: current.id, source: 'manual', ageHours: 48, metrics: { reads: 1000, saves: 90 } });
+  for (let index = 0; index < 5; index += 1) {
+    const baseline = await content(`批准基线 ${index}`);
+    await createPerformanceSnapshot({ contentId: baseline.id, source: 'manual', ageHours: 48, metrics: { reads: 1000, saves: 30 } });
+  }
+  const retrospective = await generateRetrospective(current.id);
+  const rule = await approveInsight(retrospective.insight.insightId);
+  await assert.rejects(() => dismissInsight(retrospective.insight.insightId), (error) => error.code === 'INSIGHT_ALREADY_APPROVED');
+  assert.equal((await getStrategyContext(rule.appliesWhen)).some((item) => item.ruleId === rule.ruleId), true);
+  assert.equal((await getRetrospectiveState(current.id)).retrospective.insight.status, 'approved');
 });
 
 test('PR-04 用户忽略的建议不能再被批准', async () => {

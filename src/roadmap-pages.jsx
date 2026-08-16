@@ -400,11 +400,11 @@ export function ReviewWorkspace() {
 
   useEffect(() => {
     if (!contentId) { setSnapshots([]); return; }
-    request(`/api/contents/${contentId}/performance`).then((data) => {
+    Promise.all([request(`/api/contents/${contentId}/performance`), request(`/api/contents/${contentId}/retrospective`)]).then(([data, reviewState]) => {
       setSnapshots(data.snapshots || []);
-      setRetrospective(null);
-      setApprovedRule(null);
-      setRuleDraft('');
+      setRetrospective(reviewState.retrospective || null);
+      setApprovedRule(reviewState.rule || null);
+      setRuleDraft(reviewState.rule?.rule || '');
     }).catch((error) => Message.error(error.message));
   }, [contentId]);
 

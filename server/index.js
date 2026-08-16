@@ -17,7 +17,7 @@ import { getPublicXhsFormatting, normalizeXhsFormattingOverride, resolveXhsForma
 import { createMaterialSet, deleteMaterialItem, deleteMaterialSet, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialAnalysisJob, getMaterialAsset, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, resolveMaterialConflicts, resumePendingMaterialAnalysisJobs, retryMaterialItem, updateMaterialFact } from './material-understanding.js';
 import { resetRoadmapStore } from './roadmap-store.js';
 import { cancelDeliveryJob, createDeliveryJob, createPublishPackages, deleteDeliveryForContent, deleteDeliveryReceipt, getDeliveryJob, getDeliveryReceipt, getPlatformSession, getPublishPackage, listDeliveryJobs, listDeliveryReceipts, listPublishPackages, preflightPublishPackage, resumePendingDeliveryJobs, retryDeliveryJob, startPlatformLogin } from './publish-delivery.js';
-import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getStrategyContext, listContentPerformance, listLearningRules, syncPerformanceSnapshot, updateLearningRule } from './performance-learning.js';
+import { approveInsight, createPerformanceSnapshot, deletePerformanceByReceipt, deletePerformanceForContent, deletePerformanceSnapshot, dismissInsight, generateRetrospective, getRetrospectiveState, getStrategyContext, listContentPerformance, listLearningRules, syncPerformanceSnapshot, updateLearningRule } from './performance-learning.js';
 import { listRuntimeEvents } from './adapter-runtime.js';
 
 const app = express();
@@ -515,6 +515,9 @@ app.delete('/api/performance-snapshots/:id', async (request, response, next) => 
 });
 app.post('/api/contents/:id/retrospective', async (request, response, next) => {
   try { response.json(await generateRetrospective(request.params.id, request.body.snapshotId || null)); } catch (error) { next(error); }
+});
+app.get('/api/contents/:id/retrospective', async (request, response, next) => {
+  try { response.json(await getRetrospectiveState(request.params.id)); } catch (error) { next(error); }
 });
 app.get('/api/learning-rules', async (_request, response, next) => {
   try { response.json({ rules: await listLearningRules() }); } catch (error) { next(error); }

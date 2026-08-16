@@ -41,6 +41,12 @@ function hoursBetween(start, end) {
   return round((endTime - startTime) / 3_600_000, 2);
 }
 
+function validatedCapturedAt(value) {
+  const timestamp = new Date(value).getTime();
+  if (!Number.isFinite(timestamp)) throw performanceError('PERFORMANCE_CAPTURE_TIME_INVALID', '表现数据的采集时间格式无效');
+  return new Date(timestamp).toISOString();
+}
+
 export function normalizeMetrics(rawMetrics = {}) {
   const normalized = {};
   for (const [key, value] of Object.entries(rawMetrics)) {
@@ -72,12 +78,13 @@ export async function createPerformanceSnapshot(input) {
     receipt = await getDeliveryReceipt(input.receiptId);
     if (!receipt) throw performanceError('DELIVERY_RECEIPT_NOT_FOUND', '没有找到发布回执', 404);
     if (receipt.contentId !== content.id || Number(receipt.contentRevision) !== Number(version.revision || input.contentRevision)) throw performanceError('PERFORMANCE_RECEIPT_MISMATCH', '发布回执与内容版本不一致', 409);
+    if (input.platform && input.platform !== receipt.platform) throw performanceError('PERFORMANCE_RECEIPT_PLATFORM_MISMATCH', '表现数据平台与发布回执平台不一致', 409);
   }
   if (!METRIC_SOURCES.has(input.source)) throw performanceError('METRIC_SOURCE_UNSUPPORTED', '数据来源必须是平台接口、浏览器读取或手工录入');
-  const capturedAt = input.capturedAt || now();
+  const capturedAt = validatedCapturedAt(input.capturedAt || now());
   const ageHours = receipt?.submittedAt
     ? hoursBetween(receipt.submittedAt, capturedAt)
-    : validatedAgeHours(input.ageHours ?? 0);
+    : validatedAgeHours(input.ageHours);
   const dataQuality = input.dataQuality || 'complete';
   if (!DATA_QUALITIES.has(dataQuality)) throw performanceError('METRIC_DATA_QUALITY_UNSUPPORTED', '数据完整度只能是完整、部分或待核实');
   const duplicate = (await listEntities('performanceSnapshots')).find((item) => item.contentId === content.id
@@ -215,6 +222,16 @@ export async function generateRetrospective(contentId, snapshotId = null) {
   return { snapshot: current, baseline: { status: 'available', sampleSize: values.length, windowDays: 90, metric: metric.key, median: round(medianValue), current: currentValue }, insight };
 }
 
+export async function getRetrospectiveState(contentId) {
+  const insight = (await listEntities('retrospectiveInsights'))
+    .filter((item) => item.contentId === contentId)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] || null;
+  if (!insight) return { retrospective: null, rule: null };
+  const snapshot = await getEntity('performanceSnapshots', insight.snapshotId, 'snapshotId');
+  const rule = (await listEntities('learningRules')).find((item) => item.sourceInsightId === insight.insightId) || null;
+  return { retrospective: { snapshot, baseline: null, insight }, rule };
+}
+
 export async function approveInsight(insightId) {
   const insight = await getEntity('retrospectiveInsights', insightId, 'insightId');
   if (!insight) throw performanceError('INSIGHT_NOT_FOUND', '没有找到这条复盘建议', 404);
@@ -239,9 +256,10 @@ export async function approveInsight(insightId) {
 }
 
 export async function dismissInsight(insightId) {
-  const insight = await updateEntity('retrospectiveInsights', insightId, (current) => ({ ...current, status: 'dismissed', dismissedAt: now() }), 'insightId');
-  if (!insight) throw performanceError('INSIGHT_NOT_FOUND', '没有找到这条复盘建议', 404);
-  return insight;
+  const current = await getEntity('retrospectiveInsights', insightId, 'insightId');
+  if (!current) throw performanceError('INSIGHT_NOT_FOUND', '没有找到这条复盘建议', 404);
+  if (current.status === 'approved') throw performanceError('INSIGHT_ALREADY_APPROVED', '这条建议已成为创作经验，如不再使用请停用对应经验', 409);
+  return updateEntity('retrospectiveInsights', insightId, { ...current, status: 'dismissed', dismissedAt: now() }, 'insightId');
 }
 
 export async function updateLearningRule(ruleId, patch) {
