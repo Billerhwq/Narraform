@@ -17,7 +17,10 @@
     "test:e2e:expression-mode": "node scripts/e2e-expression-mode.mjs",
     "test:e2e:question-card": "node scripts/e2e-question-card.mjs",
     "test:e2e:strategy-error": "node scripts/e2e-strategy-error.mjs",
-    "test:e2e:xhs-formatting": "node scripts/e2e-xhs-formatting-v4.mjs"
+    "test:e2e:xhs-formatting": "node scripts/e2e-xhs-formatting-v4.mjs",
+    "test:e2e:roadmap": "node scripts/e2e-roadmap-v1.mjs",
+    "prototype:roadmap": "vite prototypes/roadmap --host 127.0.0.1 --port 5188",
+    "prototype:roadmap:capture": "node scripts/capture-roadmap-prototypes.mjs"
   },
   "keywords": [],
   "author": "",
@@ -33,6 +36,7 @@
     "antd": "^6.6.0",
     "cheerio": "^1.2.0",
     "express": "^5.2.1",
+    "jszip": "^3.10.1",
     "mammoth": "^1.12.1",
     "multer": "^2.2.0",
     "pdf-parse": "^2.4.5",

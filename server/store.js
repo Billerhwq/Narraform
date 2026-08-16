@@ -14,6 +14,7 @@ const contentFile = path.join(dataDir, 'contents.json');
 const materialFile = path.join(dataDir, 'materials.json');
 const taskFile = path.join(dataDir, 'tasks.json');
 let writeQueue = Promise.resolve();
+let contentMutationQueue = Promise.resolve();
 
 async function ensureData() {
   await fs.mkdir(dataDir, { recursive: true });
@@ -86,6 +87,7 @@ export async function listContents() {
   const contents = await readJson(contentFile);
   return contents.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)).map(({ versions, ...item }) => ({
     ...item,
+    revision: Number(item.revision || versions.length),
     versionCount: versions.length,
     latestVersion: versions.at(-1) || null,
   }));
@@ -95,12 +97,42 @@ export async function getContent(id) {
   return (await readJson(contentFile)).find((item) => item.id === id) || null;
 }
 
+function revisionConflict(expected, actual) {
+  const error = new Error(`内容已经更新，当前版本为 ${actual}，请刷新后继续编辑`);
+  error.code = 'CONTENT_REVISION_CONFLICT';
+  error.status = 409;
+  error.expectedRevision = expected;
+  error.actualRevision = actual;
+  return error;
+}
+
+function mutateContents(operation) {
+  const mutation = contentMutationQueue.then(async () => {
+    const contents = await readJson(contentFile);
+    const result = await operation(contents);
+    await writeJson(contentFile, contents);
+    return result;
+  });
+  contentMutationQueue = mutation.catch(() => {});
+  return mutation;
+}
+
 export async function saveContent(payload) {
-  const contents = await readJson(contentFile);
+  return mutateContents(async (contents) => {
   const now = new Date().toISOString();
   const existingIndex = payload.id ? contents.findIndex((item) => item.id === payload.id) : -1;
+  const existing = existingIndex >= 0 ? contents[existingIndex] : null;
+  const currentRevision = existing ? Number(existing.revision || existing.versions?.length || 0) : 0;
+  if (existing && payload.operationId && existing.versions?.some((version) => version.operationId === payload.operationId)) {
+    return { ...existing, idempotentReplay: true };
+  }
+  if (existing && payload.baseRevision !== undefined && Number(payload.baseRevision) !== currentRevision) {
+    throw revisionConflict(Number(payload.baseRevision), currentRevision);
+  }
+  const revision = currentRevision + 1;
   const version = {
     id: crypto.randomUUID(),
+    revision,
     createdAt: now,
     platform: payload.platform,
     titleCandidates: payload.titleCandidates || [],
@@ -131,17 +163,17 @@ export async function saveContent(payload) {
     removedTopics: payload.removedTopics || [],
   };
   if (existingIndex >= 0) {
-    const existing = contents[existingIndex];
     contents[existingIndex] = {
       ...existing,
       name: payload.name || existing.name,
       platform: payload.platform || existing.platform,
       materialIds: payload.materialIds || existing.materialIds || [],
+      materialSetId: payload.materialSetId || existing.materialSetId || null,
       updatedAt: now,
       status: 'saved',
+      revision,
       versions: [...existing.versions, version],
     };
-    await writeJson(contentFile, contents);
     return contents[existingIndex];
   }
   const content = {
@@ -149,31 +181,74 @@ export async function saveContent(payload) {
     name: payload.name || payload.titleCandidates?.[0] || '未命名文案',
     platform: payload.platform,
     materialIds: payload.materialIds || [],
+    materialSetId: payload.materialSetId || null,
     createdAt: now,
     updatedAt: now,
     status: 'saved',
+    revision,
     versions: [version],
   };
   contents.push(content);
-  await writeJson(contentFile, contents);
   return content;
+  });
 }
 
 export async function renameContent(id, name) {
-  const contents = await readJson(contentFile);
-  const content = contents.find((item) => item.id === id);
+  return mutateContents(async (contents) => {
+    const content = contents.find((item) => item.id === id);
+    if (!content) return null;
+    content.name = name.trim() || content.name;
+    content.updatedAt = new Date().toISOString();
+    return content;
+  });
+}
+
+export async function getContentVersions(id) {
+  const content = await getContent(id);
   if (!content) return null;
-  content.name = name.trim() || content.name;
-  content.updatedAt = new Date().toISOString();
-  await writeJson(contentFile, contents);
-  return content;
+  return [...(content.versions || [])].reverse();
+}
+
+export async function restoreContentVersion(id, versionId, baseRevision) {
+  return mutateContents(async (contents) => {
+    const content = contents.find((item) => item.id === id);
+    if (!content) return null;
+    const currentRevision = Number(content.revision || content.versions?.length || 0);
+    if (baseRevision !== undefined && Number(baseRevision) !== currentRevision) {
+      throw revisionConflict(Number(baseRevision), currentRevision);
+    }
+    const source = content.versions.find((item) => item.id === versionId);
+    if (!source) {
+      const error = new Error('没有找到要恢复的版本');
+      error.code = 'VERSION_NOT_FOUND'; error.status = 404; throw error;
+    }
+    const now = new Date().toISOString();
+    const revision = currentRevision + 1;
+    const restored = {
+      ...structuredClone(source),
+      id: crypto.randomUUID(),
+      revision,
+      createdAt: now,
+      reason: 'restore',
+      operation: 'restore_version',
+      parentVersionId: source.id,
+    };
+    content.platform = restored.platform || content.platform;
+    content.updatedAt = now;
+    content.revision = revision;
+    content.status = 'saved';
+    content.versions.push(restored);
+    return content;
+  });
 }
 
 export async function deleteContent(id) {
-  const contents = await readJson(contentFile);
-  const target = contents.find((item) => item.id === id);
+  const target = await mutateContents(async (contents) => {
+    const index = contents.findIndex((item) => item.id === id);
+    if (index < 0) return null;
+    return contents.splice(index, 1)[0];
+  });
   if (!target) return false;
-  await writeJson(contentFile, contents.filter((item) => item.id !== id));
   if (target.materialIds?.length) {
     const materials = await readJson(materialFile);
     await writeJson(materialFile, materials.filter((item) => !target.materialIds.includes(item.id)));
@@ -182,6 +257,7 @@ export async function deleteContent(id) {
 }
 
 export async function resetStore() {
+  await contentMutationQueue.catch(() => {});
   await writeJson(contentFile, []);
   await writeJson(materialFile, []);
   await writeJson(taskFile, []);

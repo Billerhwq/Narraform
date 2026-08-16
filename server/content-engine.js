@@ -32,6 +32,10 @@ function outputContract(spec) {
 
 export function buildGenerationPrompt({ instruction, tone, factSet, taskBrief, strategy, spec, formattingProfile = null, currentCopy = '', action = 'generate' }) {
   const editContext = currentCopy ? `\n当前文案（修改时必须以此版本为准）：\n${currentCopy}` : '';
+  const learningGuidance = (strategy?.learningGuidance || taskBrief?.learningRulesApplied?.map((item) => item.rule) || []).filter(Boolean);
+  const learningContext = learningGuidance.length
+    ? `\n用户已批准且本次未取消的历史经验：\n${learningGuidance.map((item) => `- ${item}`).join('\n')}\n这些经验只是表达建议，不能覆盖本次用户要求、事实边界或平台硬规则。`
+    : '';
   const productVoice = spec.id === 'xiaohongshu' && taskBrief.contentType === 'product_marketing'
     ? `\n产品营销附加合同：
 - 以产品团队面向目标用户的口吻写，不使用第三方测评、资料转述或旁观推荐口吻。
@@ -80,7 +84,7 @@ ${spec.styleRules.map((rule) => `- ${rule}`).join('\n')}
 CTA 规则：
 ${spec.ctaRules.map((rule) => `- ${rule}`).join('\n')}
   禁止模式：
-  ${spec.forbiddenPatterns.map((rule) => `- ${rule}`).join('\n')}
+  ${spec.forbiddenPatterns.map((rule) => `- ${rule}`).join('\n')}${learningContext}
   交付前自检：
   ${(spec.qualityRules || []).map((rule) => `- ${rule}`).join('\n') || '- 所有字段符合平台合同'}${productVoice}${lengthContract}
 ${formattingContract}

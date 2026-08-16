@@ -4,6 +4,7 @@ import app from '../server/index.js';
 import { createChangeSet, hashContent } from '../server/change-set.js';
 import { executeContentOperation } from '../server/operation-engine.js';
 import { getOperationSpec, getPublicOperationSpecs, validateOperationSpec } from '../server/operation-specs.js';
+import { getContent, getContentVersions, saveContent } from '../server/store.js';
 
 const currentResult = {
   resultId: 'result-parent',
@@ -161,4 +162,36 @@ test('SSE 流式接口依次返回 started、delta、verifying、completed', asy
   assert.ok(events.indexOf('verifying') > events.indexOf('delta'));
   assert.ok(events.indexOf('completed') > events.indexOf('verifying'));
   assert.match(text, /AI|operationId/);
+});
+
+test('SSE 流式操作保存一个新版本并返回 version.saved', async () => {
+  const initial = await saveContent({
+    name: '流式保存测试',
+    platform: currentResult.platform,
+    titleCandidates: currentResult.titleCandidates,
+    selectedTitleIndex: currentResult.selectedTitleIndex,
+    summary: currentResult.summary,
+    bodyMarkdown: currentResult.bodyMarkdown,
+    topics: currentResult.topics,
+  });
+  const response = await fetch(`${baseUrl}/api/content-operations/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request('polish', {
+      contentId: initial.id,
+      baseRevision: initial.revision,
+      preset: 'de_ai',
+    })),
+  });
+  assert.equal(response.status, 200);
+  const text = await response.text();
+  const events = [...text.matchAll(/^event: (.+)$/gm)].map((match) => match[1]);
+  assert.ok(events.includes('version.saved'));
+  assert.ok(events.indexOf('version.saved') < events.indexOf('operation.completed'));
+
+  const saved = await getContent(initial.id);
+  const versions = await getContentVersions(initial.id);
+  assert.equal(saved.revision, 2);
+  assert.equal(versions.length, 2);
+  assert.notEqual(saved.bodyMarkdown, currentResult.bodyMarkdown);
 });

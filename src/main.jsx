@@ -1,29 +1,33 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Sender } from '@ant-design/x';
-import { EditorContent, useEditor } from '@tiptap/react';
-import StarterKit from '@tiptap/starter-kit';
-import { Markdown } from '@tiptap/markdown';
-import Placeholder from '@tiptap/extension-placeholder';
 import { Button as AntButton, ConfigProvider, Dropdown as AntDropdown } from 'antd';
 import { Alert, Button, Drawer, Input, Message, Modal, Radio, Space, Spin, Tag, Tooltip, Trigger } from '@arco-design/web-react';
 import {
   IconAttachment, IconBulb, IconCheck, IconCheckCircleFill, IconClose, IconCopy,
   IconDelete, IconEdit, IconExclamationCircleFill, IconFile, IconHistory, IconHome,
   IconInfoCircleFill, IconLink, IconMenu, IconMore, IconPlus, IconRefresh, IconRobot, IconDown,
-  IconUpload, IconUser, IconBold, IconItalic, IconH1, IconH2, IconOrderedList,
-  IconUnorderedList, IconQuote, IconUndo, IconRedo, IconStop, IconBrush,
+  IconUpload, IconUser, IconStop, IconBrush,
+  IconFolder, IconSend, IconExperiment,
 } from '@arco-design/web-react/icon';
 import { SiZhihu } from 'react-icons/si';
 import { SocialIcon } from 'react-social-icons';
 import '@arco-design/web-react/dist/css/arco.css';
 import './styles.css';
 import { clearScopedError, replaceScopedError, requestErrorMessage, STRATEGY_GENERATION_ERROR } from './request-errors.js';
+import { RichTextEditor } from './rich-text-editor.jsx';
+import { formatTime, Header, HistoryPage, ProductNav } from './app-shell.jsx';
+import { MaterialsDrawer, QualityDrawer, VersionsDrawer } from './content-drawers.jsx';
+
+const MaterialsWorkspace = lazy(() => import('./roadmap-pages.jsx').then((module) => ({ default: module.MaterialsWorkspace })));
+const PublishWorkspace = lazy(() => import('./roadmap-pages.jsx').then((module) => ({ default: module.PublishWorkspace })));
+const ReviewWorkspace = lazy(() => import('./roadmap-pages.jsx').then((module) => ({ default: module.ReviewWorkspace })));
 
 const TextArea = Input.TextArea;
 const DRAFT_KEY = 'contentflow-v1-draft';
 const PREF_KEY = 'contentflow-v1-preferences';
 const CHAT_CLEAR_MARKER = 'contentflow-chat-cleared-20260815';
+const MATERIAL_SET_KEY = 'narraform-active-material-set';
 
 const platformOptions = [
   { label: '小红书', value: 'xiaohongshu', network: 'xiaohongshu', color: '#ff2442' },
@@ -311,6 +315,7 @@ function App() {
   const preferences = readLocal(PREF_KEY, { platform: 'xiaohongshu', tone: expressionModes[0].tone, formattingOverride: { platformFeel: 'auto', emoji: 'auto' } });
   const recovered = recoverDraftAfterChatClear();
   const [section, setSection] = useState('create');
+  const [materialSetId, setMaterialSetId] = useState(() => localStorage.getItem(MATERIAL_SET_KEY) || '');
   const [navOpen, setNavOpen] = useState(false);
   const [materialsOpen, setMaterialsOpen] = useState(false);
   const [qualityOpen, setQualityOpen] = useState(false);
@@ -340,6 +345,7 @@ function App() {
   const draftTimer = useRef(null);
   const autosaveTimer = useRef(null);
   const contentIdRef = useRef(recovered?.contentId || null);
+  const contentRevisionRef = useRef(null);
   const persistQueue = useRef(Promise.resolve());
   const editRevision = useRef(0);
   const legacyTopicRepairs = useRef(new Set());
@@ -357,6 +363,10 @@ function App() {
   };
 
   useEffect(() => { refreshContents(); }, []);
+  useEffect(() => {
+    if (materialSetId) localStorage.setItem(MATERIAL_SET_KEY, materialSetId);
+    else localStorage.removeItem(MATERIAL_SET_KEY);
+  }, [materialSetId]);
   useEffect(() => { localStorage.setItem(PREF_KEY, JSON.stringify({ platform, tone, formattingOverride })); }, [platform, tone, formattingOverride]);
   useEffect(() => {
     clearTimeout(draftTimer.current);
@@ -374,7 +384,8 @@ function App() {
   const resetDraft = () => {
     strategyRequestLock.current = false;
     contentIdRef.current = null;
-    setPrompt(''); setMessages([]); setResult(null); setContentId(null); setMaterials([]); setPendingInstruction(''); setTaskBrief(null); setSelectedStrategyId(null); setDirty(false); setSection('create'); setNavOpen(false);
+    contentRevisionRef.current = null;
+    setPrompt(''); setMessages([]); setResult(null); setContentId(null); setMaterials([]); setMaterialSetId(''); setPendingInstruction(''); setTaskBrief(null); setSelectedStrategyId(null); setDirty(false); setSection('create'); setNavOpen(false);
     setAutosaveState('saved'); setLastSavedAt(null);
     setActiveOperation(null); setOperationProgress(null); setStreamPreview(''); setLastOperation(null); setUndoSnapshot(null);
     localStorage.removeItem(DRAFT_KEY);
@@ -414,7 +425,7 @@ function App() {
     setMessages((current) => [...current, { role: 'user', text: request, id: crypto.randomUUID() }]);
     setPrompt(''); setGenerating(true);
     try {
-      const data = await api('/api/tasks/understand', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction, platform, tone, materialIds: materials.map((item) => item.id) }) });
+      const data = await api('/api/tasks/understand', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ instruction, platform, tone, materialIds: materials.map((item) => item.id), materialSetId: materialSetId || undefined }) });
       if (data.status === 'needs_input') {
         setTaskBrief(data.taskBrief || null);
         setSelectedStrategyId(null);
@@ -460,13 +471,28 @@ function App() {
     }
   };
 
+  const toggleLearningRule = async (ruleId, enabled) => {
+    if (!taskBrief || generating) return;
+    setGenerating(true);
+    try {
+      const data = await api(`/api/tasks/${taskBrief.taskId}/learning-rules/${ruleId}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }),
+      });
+      setTaskBrief(data.taskBrief);
+      setSelectedStrategyId(null);
+      Message.success(enabled ? '本次创作会参考这条经验' : '本次创作已取消这条经验');
+    } catch (error) { Message.error(error.message); }
+    finally { setGenerating(false); }
+  };
+
   const persistCurrent = async (reason) => {
     if (!result) return contentIdRef.current;
     const save = async () => {
-      const checked = await checkCurrentResult();
+      const checked = await checkCurrentResult({ trackRepairs: false });
       const selectedTitle = checked.titleCandidates?.[checked.selectedTitleIndex || 0];
-      const data = await api('/api/contents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: contentIdRef.current, name: selectedTitle || '未命名文案', platform, materialIds: materials.map((item) => item.id), ...checked, reason }) });
+      const data = await api('/api/contents', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: contentIdRef.current, baseRevision: contentIdRef.current ? contentRevisionRef.current : undefined, name: selectedTitle || '未命名文案', platform, materialIds: materials.map((item) => item.id), materialSetId: materialSetId || undefined, ...checked, reason }) });
       contentIdRef.current = data.content.id;
+      contentRevisionRef.current = data.content.revision;
       setContentId(data.content.id); setOpenedContent(data.content); await refreshContents();
       return data.content.id;
     };
@@ -480,9 +506,10 @@ function App() {
     const data = await api('/api/contents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, name: selectedTitle || '未命名文案', platform, materialIds: materials.map((item) => item.id), ...value, reason }),
+      body: JSON.stringify({ id, baseRevision: id ? contentRevisionRef.current : undefined, name: selectedTitle || '未命名文案', platform, materialIds: materials.map((item) => item.id), materialSetId: materialSetId || undefined, ...value, reason }),
     });
     contentIdRef.current = data.content.id;
+    contentRevisionRef.current = data.content.revision;
     setContentId(data.content.id);
     setOpenedContent(data.content);
     await refreshContents();
@@ -503,6 +530,7 @@ function App() {
       const savedId = await persistCurrent(`before-${operation}`);
       const bodyHash = await sha256(before.bodyMarkdown || '');
       const payload = {
+        operationId: crypto.randomUUID(),
         operation,
         platform,
         platformMode: before.platformMode,
@@ -515,6 +543,9 @@ function App() {
         currentResult: before,
         parentResultId: before.resultId,
         bodyHash,
+        contentId: savedId,
+        baseRevision: contentRevisionRef.current,
+        materialSetId: materialSetId || undefined,
         ...details,
       };
       const data = await streamContentOperation(payload, {
@@ -526,7 +557,16 @@ function App() {
         },
       });
       setAutosaveState('saving');
-      await persistOperationResult(data.result, savedId, operation);
+      if (data.savedContent) {
+        contentIdRef.current = data.savedContent.id;
+        contentRevisionRef.current = data.savedContent.revision;
+        setContentId(data.savedContent.id);
+        const refreshed = await api(`/api/contents/${data.savedContent.id}`);
+        setOpenedContent(refreshed.content);
+        await refreshContents();
+      } else {
+        await persistOperationResult(data.result, savedId, operation);
+      }
       setUndoSnapshot(before);
       setResult(data.result);
       setLastOperation({ operation, changeSet: data.changeSet, resultId: data.result.resultId });
@@ -640,7 +680,7 @@ function App() {
       } catch {
         setAutosaveState('error');
       }
-    }, 700);
+    }, 500);
     return () => clearTimeout(autosaveTimer.current);
   }, [result, dirty, generating, activeOperation, platform, materials]);
 
@@ -652,8 +692,8 @@ function App() {
 
   const loadContentNow = async (id) => {
     try {
-      const data = await api(`/api/contents/${id}`); const latest = data.content.versions.at(-1); contentIdRef.current = data.content.id;
-      setOpenedContent(data.content); setContentId(data.content.id); setPlatform(latest.platform); setFormattingOverride(latest.formattingOverride || { platformFeel: 'auto', emoji: 'auto' }); setResult(latest); setTaskBrief(null); setSelectedStrategyId(latest.strategyId || null); setMessages([{ role: 'assistant', type: 'loaded', text: '已打开保存的文案，可以继续编辑或提出修改要求。', id: crypto.randomUUID() }]); setMaterials(data.materials || []); setDirty(false); setAutosaveState('saved'); setLastSavedAt(new Date(data.content.updatedAt)); setSection('create');
+      const data = await api(`/api/contents/${id}`); const latest = data.content.versions.at(-1); contentIdRef.current = data.content.id; contentRevisionRef.current = data.content.revision || data.content.versions.length;
+      setOpenedContent(data.content); setContentId(data.content.id); setMaterialSetId(data.content.materialSetId || ''); setPlatform(latest.platform); setFormattingOverride(latest.formattingOverride || { platformFeel: 'auto', emoji: 'auto' }); setResult(latest); setTaskBrief(null); setSelectedStrategyId(latest.strategyId || null); setMessages([{ role: 'assistant', type: 'loaded', text: '已打开保存的文案，可以继续编辑或提出修改要求。', id: crypto.randomUUID() }]); setMaterials(data.materials || []); setDirty(false); setAutosaveState('saved'); setLastSavedAt(new Date(data.content.updatedAt)); setSection('create');
     } catch (error) { Message.error(error.message); }
   };
 
@@ -667,34 +707,34 @@ function App() {
   return <div className="app-shell">
     <Header section={section} autosaveState={autosaveState} onMenu={() => setNavOpen(true)} onNew={startNew} />
     <ProductNav active={section} contents={contents} onChange={openSection} onNew={startNew} onOpen={loadContent} onDelete={deleteRecord} />
-    <main className={section === 'create' ? 'assistant-workspace' : 'user-workspace'}>
+    <main className={section === 'create' ? 'assistant-workspace' : section === 'history' ? 'user-workspace' : 'roadmap-host'}>
       {section === 'create' ? <CopyAssistant
         messages={messages} result={result} platform={platform} setPlatform={setPlatform} tone={tone} setTone={setTone} formattingOverride={formattingOverride}
-        prompt={prompt} setPrompt={setPrompt} materials={materials} removeMaterial={(id) => { setMaterials((items) => items.filter((item) => item.id !== id)); markDirty(); }}
+        prompt={prompt} setPrompt={setPrompt} materials={materials} removeMaterial={(id) => { setMaterials((items) => items.filter((item) => item.id !== id)); markDirty(); }} toggleLearningRule={toggleLearningRule}
         generating={generating} submit={submit} taskBrief={taskBrief} selectedStrategyId={selectedStrategyId} selectStrategy={selectStrategy} updateResult={updateResult} quickModify={quickModify} regeneratePart={regeneratePart} polishContent={polishContent} dirty={dirty} autosaveState={autosaveState} lastSavedAt={lastSavedAt}
         activeOperation={activeOperation} operationProgress={operationProgress} streamPreview={streamPreview} cancelOperation={cancelOperation} lastOperation={lastOperation} undoLastOperation={undoLastOperation}
         openMaterials={() => setMaterialsOpen(true)} openQuality={async () => { await checkCurrentResult(); setQualityOpen(true); }} openVersions={() => { setVersionsOpen(true); }} contentId={contentId} checkResult={checkCurrentResult} applyExpressionMode={applyExpressionMode}
-      /> : <HistoryPage contents={contents} onOpen={loadContent} onNew={startNew} onDelete={deleteRecord} onRename={renameRecord} />}
+      /> : section === 'materials' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开素材理解</span></div>}><MaterialsWorkspace materialSetId={materialSetId} onMaterialSetChange={setMaterialSetId} onUseForCreation={(set) => { setMaterialSetId(set.materialSetId); setSection('create'); Message.success('创作时会使用这组已确认资料'); }} /></Suspense>
+        : section === 'publish' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开平台发布</span></div>}><PublishWorkspace materialSetId={materialSetId} /></Suspense>
+          : section === 'review' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开内容复盘</span></div>}><ReviewWorkspace /></Suspense>
+      : <HistoryPage contents={contents} onOpen={loadContent} onNew={startNew} onDelete={deleteRecord} onRename={renameRecord} platformOptions={platformOptions} />}
     </main>
     <Drawer className="nav-drawer" title="Narraform" width={280} placement="left" visible={navOpen} onCancel={() => setNavOpen(false)} footer={null}><ProductNav active={section} contents={contents} onChange={openSection} onNew={startNew} onOpen={loadContent} onDelete={deleteRecord} mobile /></Drawer>
-    <MaterialsDrawer visible={materialsOpen} onClose={() => setMaterialsOpen(false)} materials={materials} onAdded={(items) => { setMaterials((current) => [...current, ...items].slice(0, 10)); markDirty(); }} />
+    <MaterialsDrawer visible={materialsOpen} onClose={() => setMaterialsOpen(false)} onOpenWorkspace={() => { setMaterialsOpen(false); setSection('materials'); }} materials={materials} request={api} onAdded={(items) => { setMaterials((current) => [...current, ...items].slice(0, 10)); markDirty(); }} />
     <QualityDrawer visible={qualityOpen} onClose={() => setQualityOpen(false)} result={result} onFix={(warning) => { setQualityOpen(false); quickModify(`修复这项问题，并保持其他内容不变：${warning}`); }} />
-    <VersionsDrawer visible={versionsOpen} onClose={() => setVersionsOpen(false)} content={openedContent} current={result} onUse={(version) => { setResult(version); setPlatform(version.platform); markDirty(); setVersionsOpen(false); }} />
+    <VersionsDrawer visible={versionsOpen} onClose={() => setVersionsOpen(false)} content={openedContent} current={result} onUse={async (version) => {
+      if (!contentIdRef.current) { setResult(version); setPlatform(version.platform); markDirty(); setVersionsOpen(false); return; }
+      try {
+        const data = await api(`/api/contents/${contentIdRef.current}/versions/${version.id}/restore`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': String(contentRevisionRef.current) }, body: JSON.stringify({ baseRevision: contentRevisionRef.current }) });
+        contentRevisionRef.current = data.content.revision; setOpenedContent(data.content); setResult(data.version); setPlatform(data.version.platform); setDirty(false); setAutosaveState('saved'); setVersionsOpen(false); await refreshContents(); Message.success('已恢复为新版本');
+      } catch (error) { Message.error(error.message); }
+    }} />
   </div>;
-}
-
-function Header({ section, autosaveState, onMenu, onNew }) {
-  const status = autosaveState === 'saving' || autosaveState === 'pending' ? '正在自动保存' : autosaveState === 'error' ? '自动保存暂时失败' : '已自动保存';
-  return <header className="top-command"><div className="brand-block"><span className="brand-mark"><IconRobot /></span><strong>Narraform</strong></div><div className="project-identity"><Button className="mobile-menu" type="text" icon={<IconMenu />} aria-label="打开导航" onClick={onMenu} /><div><span>{section === 'create' ? 'AI 文案助手' : '内容记录'}</span><small className={`global-save-state is-${autosaveState}`}>{status}</small></div></div><Space size={8} className="top-actions">{section === 'create' && <Tooltip content="新建文案"><Button icon={<IconPlus />} aria-label="新建文案" onClick={onNew} /></Tooltip>}<Button icon={<IconMore />} aria-label="更多操作" /></Space></header>;
-}
-
-function ProductNav({ active, contents, onChange, onNew, onOpen, onDelete, mobile = false }) {
-  return <aside className={mobile ? 'product-nav mobile' : 'product-nav'} aria-label="主菜单"><Button className="new-copy-button" type="primary" long icon={<IconPlus />} onClick={onNew}>新建文案</Button><nav className="nav-primary"><button className={active === 'create' ? 'active' : ''} onClick={() => onChange('create')}><IconRobot /><span>开始创作</span></button><button className={active === 'history' ? 'active' : ''} onClick={() => onChange('history')}><IconHome /><span>内容记录</span></button></nav><div className="nav-recent"><span>最近内容</span>{contents.slice(0, 4).map((item) => <div className="recent-item" key={item.id}><button className="recent-open" onClick={() => onOpen(item.id)}><IconFile /><span>{item.name}<small>{formatTime(item.updatedAt)}</small></span></button><Tooltip content="删除这条内容" position="right"><button className="recent-delete" aria-label={`删除 ${item.name}`} onClick={() => onDelete(item.id)}><IconDelete /></button></Tooltip></div>)}</div></aside>;
 }
 
 function CopyAssistant(props) {
   const empty = !props.messages.length && !props.result;
-  return <section className={`assistant-shell ${empty ? 'is-empty' : ''}`}><div className="conversation">{empty ? <Welcome submit={props.submit} /> : <><div className="assistant-message intro-message"><Avatar /><div className="message-body"><p>把目标和资料告诉我。我会先整理事实并推荐内容方向，等你选择后再按平台生成。</p></div></div>{props.messages.map((message) => <MessageItem key={message.id} message={message} result={props.result} />)}{props.taskBrief?.status !== 'needs_input' && !props.result && <StrategyChooser taskBrief={props.taskBrief} selectedStrategyId={props.selectedStrategyId} loading={props.generating} onSelect={props.selectStrategy} />}{props.result && <ResultEditor {...props} />}{props.generating && <div className="assistant-message"><Avatar /><div className="message-body typing"><i /><i /><i /><span>{props.selectedStrategyId ? '正在按选定方向生成文案' : '正在理解任务和整理事实'}</span></div></div>}</>}</div><Composer {...props} /></section>;
+  return <section className={`assistant-shell ${empty ? 'is-empty' : ''}`}><div className="conversation">{empty ? <Welcome submit={props.submit} /> : <><div className="assistant-message intro-message"><Avatar /><div className="message-body"><p>把目标和资料告诉我。我会先整理事实并推荐内容方向，等你选择后再按平台生成。</p></div></div>{props.messages.map((message) => <MessageItem key={message.id} message={message} result={props.result} />)}{props.taskBrief?.status !== 'needs_input' && !props.result && <StrategyChooser taskBrief={props.taskBrief} selectedStrategyId={props.selectedStrategyId} loading={props.generating} onSelect={props.selectStrategy} onToggleLearningRule={props.toggleLearningRule} />}{props.result && <ResultEditor {...props} />}{props.generating && <div className="assistant-message"><Avatar /><div className="message-body typing"><i /><i /><i /><span>{props.selectedStrategyId ? '正在按选定方向生成文案' : '正在理解任务和整理事实'}</span></div></div>}</>}</div><Composer {...props} /></section>;
 }
 
 function Welcome({ submit }) { return <div className="welcome-state"><div className="welcome-heading"><span className="assistant-avatar large"><IconRobot /></span><div><span className="welcome-kicker">AI 文案助手</span><h1>今天想写什么？</h1></div></div><p>从一个想法开始，或者继续修改已有文字。</p><div className="quick-starts">{quickStarts.map((item) => <button key={item} onClick={() => submit(item)}><IconBulb /><span>{item}</span></button>)}</div></div>; }
@@ -706,9 +746,10 @@ function MessageItem({ message }) {
   return <div className={`assistant-message ${message.type || ''}`}><span className="assistant-avatar">{icon}</span><div className="message-body">{message.type === 'question' ? <div className="question-content"><span className="question-kicker"><IconInfoCircleFill />还缺一项信息</span><p>{message.text}</p></div> : <p>{message.text}</p>}</div></div>;
 }
 
-function StrategyChooser({ taskBrief, selectedStrategyId, loading, onSelect }) {
+function StrategyChooser({ taskBrief, selectedStrategyId, loading, onSelect, onToggleLearningRule }) {
   if (!taskBrief?.strategyOptions?.length) return null;
-  return <div className="assistant-message strategy-message"><Avatar /><div className="message-body strategy-panel"><div className="strategy-summary"><div><span className="strategy-kicker">内容方向</span><h2>选择这篇文案怎么切入</h2></div><Tag color="arcoblue">已确认 {taskBrief.facts?.length || 0} 条事实</Tag></div><p className="strategy-context">面向 {taskBrief.strategyOptions[0]?.audience?.label || '目标读者'}，目标是{taskBrief.strategyOptions[0]?.goal || '清楚表达核心信息'}。</p><div className="strategy-options">{taskBrief.strategyOptions.map((strategy, index) => {
+  const appliedIds = new Set((taskBrief.learningRulesApplied || []).map((item) => item.ruleId));
+  return <div className="assistant-message strategy-message"><Avatar /><div className="message-body strategy-panel"><div className="strategy-summary"><div><span className="strategy-kicker">内容方向</span><h2>选择这篇文案怎么切入</h2></div><Tag color="arcoblue">已确认 {taskBrief.facts?.length || 0} 条事实</Tag></div><p className="strategy-context">面向 {taskBrief.strategyOptions[0]?.audience?.label || '目标读者'}，目标是{taskBrief.strategyOptions[0]?.goal || '清楚表达核心信息'}。</p>{taskBrief.learningRulesAvailable?.length ? <div className="strategy-learning-context"><IconExperiment /><div><strong>已确认的创作经验</strong>{taskBrief.learningRulesAvailable.map((rule) => { const applied = appliedIds.has(rule.ruleId); return <span className={`strategy-learning-rule ${applied ? '' : 'is-disabled'}`} key={rule.ruleId}><span>{rule.rule}</span><Button type="text" size="mini" disabled={loading} onClick={() => onToggleLearningRule(rule.ruleId, !applied)}>{applied ? '本次不采用' : '本次采用'}</Button></span>; })}</div></div> : null}<div className="strategy-options">{taskBrief.strategyOptions.map((strategy, index) => {
     const active = selectedStrategyId === strategy.id;
     return <article className={`strategy-option ${active ? 'active' : ''}`} key={strategy.id}><div className="strategy-title"><span>{index + 1}</span><div><h3>{strategy.name}</h3>{index === 0 && <small>推荐</small>}</div></div><p>{strategy.description}</p><dl><div><dt>开头</dt><dd>{strategy.hook}</dd></div><div><dt>核心</dt><dd>{strategy.coreMessage}</dd></div></dl><div className="strategy-footer"><span>{strategy.structure.slice(0, 3).join(' · ')}</span><Button type={index === 0 ? 'primary' : 'secondary'} loading={active && loading} disabled={loading && !active} onClick={() => onSelect(strategy.id)}>用这个方向</Button></div></article>;
   })}</div><small className="strategy-note">受众和目标由系统根据当前信息推断，仅用于组织表达，不会写成调研结论。</small></div></div>;
@@ -801,68 +842,6 @@ function TopicEditor({ topics, config, onChange }) {
     setInput('');
   };
   return <div className="topic-chip-editor" aria-label={config.label}><div className="topic-chip-list">{topics.map((topic) => <Tag key={topic} className="topic-chip" closable onClose={() => onChange(topics.filter((item) => item !== topic))}>{config.marker}{topic}</Tag>)}{adding ? <Input ref={inputRef} className="custom-topic-input" value={input} onChange={setInput} placeholder={config.placeholder} onPressEnter={commit} onBlur={commit} onKeyDown={(event) => { if (event.key === 'Escape') { setAdding(false); setInput(''); } }} /> : <Button className="custom-topic-button" type="text" size="small" icon={<IconPlus />} onClick={() => setAdding(true)}>自定义标签</Button>}</div></div>;
-}
-
-function RichTextEditor({ value, onChange, readOnly = false, streaming = false, onPolish }) {
-  const [selection, setSelection] = useState(null);
-  const editor = useEditor({
-    extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2] } }),
-      Markdown,
-      Placeholder.configure({ placeholder: '从这里开始编辑正文...' }),
-    ],
-    content: value || '',
-    contentType: 'markdown',
-    editable: !readOnly,
-    immediatelyRender: false,
-    onUpdate: ({ editor: current }) => onChange?.(current.getMarkdown()),
-    onSelectionUpdate: ({ editor: current }) => {
-      if (readOnly) return setSelection(null);
-      const { from, to } = current.state.selection;
-      const selectedText = current.state.doc.textBetween(from, to, '\n').trim();
-      if (!selectedText) return setSelection(null);
-      const markdown = current.getMarkdown();
-      const start = markdown.indexOf(selectedText);
-      setSelection(start >= 0 ? { start, end: start + selectedText.length, selectedText } : null);
-    },
-  }, [readOnly]);
-
-  useEffect(() => {
-    if (!editor) return;
-    editor.setEditable(!readOnly);
-    const current = editor.getMarkdown();
-    if (current !== (value || '')) editor.commands.setContent(value || '', { contentType: 'markdown', emitUpdate: false });
-  }, [editor, value, readOnly]);
-
-  if (!editor) return <div className="rich-editor-loading"><Spin size={18} /></div>;
-  const tool = (label, icon, action, active = false, disabled = false) => <Tooltip key={label} content={label}><Button className={active ? 'is-active' : ''} type="text" size="mini" icon={icon} aria-label={label} disabled={disabled || readOnly} onClick={action} /></Tooltip>;
-  return <div className={`rich-editor ${readOnly ? 'is-readonly' : ''} ${streaming ? 'is-candidate' : ''}`}>
-    {!streaming && <div className="rich-editor-toolbar" role="toolbar" aria-label="正文格式">
-      <span>
-        {tool('粗体', <IconBold />, () => editor.chain().focus().toggleBold().run(), editor.isActive('bold'))}
-        {tool('斜体', <IconItalic />, () => editor.chain().focus().toggleItalic().run(), editor.isActive('italic'))}
-      </span>
-      <i />
-      <span>
-        {tool('一级标题', <IconH1 />, () => editor.chain().focus().toggleHeading({ level: 1 }).run(), editor.isActive('heading', { level: 1 }))}
-        {tool('二级标题', <IconH2 />, () => editor.chain().focus().toggleHeading({ level: 2 }).run(), editor.isActive('heading', { level: 2 }))}
-        {tool('无序列表', <IconUnorderedList />, () => editor.chain().focus().toggleBulletList().run(), editor.isActive('bulletList'))}
-        {tool('有序列表', <IconOrderedList />, () => editor.chain().focus().toggleOrderedList().run(), editor.isActive('orderedList'))}
-        {tool('引用', <IconQuote />, () => editor.chain().focus().toggleBlockquote().run(), editor.isActive('blockquote'))}
-      </span>
-      <i />
-      <span>
-        {tool('撤销编辑', <IconUndo />, () => editor.chain().focus().undo().run(), false, !editor.can().undo())}
-        {tool('重做编辑', <IconRedo />, () => editor.chain().focus().redo().run(), false, !editor.can().redo())}
-      </span>
-    </div>}
-    <div className="rich-editor-canvas"><EditorContent editor={editor} aria-label={streaming ? 'AI 流式改写候选' : '生成的文案'} /></div>
-    {selection && onPolish && <div className="selection-polish" role="toolbar" aria-label="选中内容 AI 操作">
-      <Button size="mini" icon={<IconBrush />} onMouseDown={(event) => event.preventDefault()} onClick={() => onPolish('de_ai', selection)}>润色</Button>
-      <Button size="mini" onMouseDown={(event) => event.preventDefault()} onClick={() => onPolish('concise', selection)}>精简</Button>
-      <Button size="mini" onMouseDown={(event) => event.preventDefault()} onClick={() => onPolish('natural', selection)}>更自然</Button>
-    </div>}
-  </div>;
 }
 
 function Field({ label, extra, children, className = '' }) { return <section className={`result-field ${className}`}><div className="result-field-label"><b>{label}</b>{extra && <small>{extra}</small>}</div>{children}</section>; }
@@ -958,32 +937,5 @@ function Composer({ prompt, setPrompt, platform, setPlatform, tone, formattingOv
   const header = materials.length > 0 ? <div className="sender-materials"><div className="material-chips">{materials.map((item) => <Tag key={item.id} closable onClose={() => removeMaterial(item.id)} icon={<IconFile />}>{item.displayName} · {item.characterCount} 字</Tag>)}</div></div> : false;
   return <ConfigProvider theme={{ token: { colorPrimary: '#175cd3', borderRadius: 8, fontFamily: 'Inter, "PingFang SC", "Microsoft YaHei", sans-serif' } }}><div className="composer-wrap"><Sender className="content-sender" value={prompt} onChange={setPrompt} onSubmit={(message) => submit(message)} loading={generating} submitType="enter" autoSize={{ minRows: 2, maxRows: 7 }} placeholder={result ? '继续修改：换个开头、减少营销感，或改成其他平台...' : '描述你想写的内容，也可以添加产品介绍、活动信息或已有文案...'} header={header} suffix={false} footer={(_node, { components }) => { const ActionButton = generating ? components.LoadingButton : components.SendButton; return <div className="sender-footer"><div className="sender-controls"><AntButton className="sender-tool-button attach-button" type="text" size="small" icon={<IconAttachment />} aria-label="添加资料" onClick={openMaterials}>添加资料{materials.length ? ` (${materials.length})` : ''}</AntButton><AntDropdown menu={platformMenu} trigger={['click']} placement="topLeft" classNames={{ root: 'platform-dropdown' }}><AntButton className="sender-tool-button platform-trigger" type="text" size="small"><PlatformBrand value={platform} /><span>{currentPlatform.label}</span><IconDown /></AntButton></AntDropdown><ExpressionModePicker tone={tone} platform={platform} prompt={prompt} taskBrief={taskBrief} result={result} generating={generating} onApply={applyExpressionMode} formattingOverride={formattingOverride} /></div><ActionButton aria-label={generating ? '正在生成' : result ? '发送修改要求' : '生成文案'} /></div>; }} /></div></ConfigProvider>;
 }
-
-function MaterialsDrawer({ visible, onClose, materials, onAdded }) {
-  const [mode, setMode] = useState('file'); const [text, setText] = useState(''); const [url, setUrl] = useState(''); const [loading, setLoading] = useState(false); const inputRef = useRef(null);
-  const addFiles = async (files) => { if (!files?.length) return; if (materials.length + files.length > 10) return Message.warning('单次最多使用 10 份资料'); setLoading(true); try { const form = new FormData(); [...files].forEach((file) => form.append('files', file)); const data = await api('/api/materials/upload', { method: 'POST', body: form }); onAdded(data.materials); Message.success('资料已读取'); } catch (error) { Message.error(error.message); } finally { setLoading(false); if (inputRef.current) inputRef.current.value = ''; } };
-  const addStructured = async () => { setLoading(true); try { const data = mode === 'text' ? await api('/api/materials/text', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) }) : await api('/api/materials/url', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) }); onAdded([data.material]); setText(''); setUrl(''); Message.success('资料已读取'); } catch (error) { Message.error(error.message); } finally { setLoading(false); } };
-  return <Drawer title="添加资料" width={480} visible={visible} onCancel={onClose} footer={null}><div className="material-modes"><button className={mode === 'file' ? 'active' : ''} onClick={() => setMode('file')}><IconUpload />上传文件</button><button className={mode === 'text' ? 'active' : ''} onClick={() => setMode('text')}><IconEdit />粘贴文字</button><button className={mode === 'url' ? 'active' : ''} onClick={() => setMode('url')}><IconLink />网页链接</button></div>{mode === 'file' && <div className="upload-zone" onClick={() => inputRef.current?.click()}><input ref={inputRef} type="file" multiple accept=".txt,.md,.markdown,.pdf,.docx" onChange={(event) => addFiles(event.target.files)} /><IconUpload /><strong>{loading ? '正在读取资料' : '选择文件'}</strong><span>支持 TXT、Markdown、PDF、DOCX；单个文件不超过 15 MB</span></div>}{mode === 'text' && <div className="material-form"><TextArea value={text} onChange={setText} autoSize={{ minRows: 12 }} placeholder="粘贴需要用于写作的正文。文件名和来源说明不会进入对外文案。" /><Button type="primary" long loading={loading} disabled={!text.trim()} onClick={addStructured}>使用这段文字</Button></div>}{mode === 'url' && <div className="material-form"><Input value={url} onChange={setUrl} placeholder="https://example.com/article" /><Alert type="info" content="系统只读取你主动提供的网页，不会自动搜索或补充外部事实。" /><Button type="primary" long loading={loading} disabled={!url.trim()} onClick={addStructured}>读取网页</Button></div>}<div className="drawer-material-list"><h3>本次使用的资料 <small>{materials.length}/10</small></h3>{materials.length ? materials.map((item) => <div key={item.id}><IconCheck /><span><strong>{item.displayName}</strong><small>{item.kind === 'url' ? '网页' : item.kind === 'text' ? '粘贴文字' : '文件'} · {item.characterCount} 字</small></span></div>) : <p>尚未添加资料。清晰的单句需求也可以直接生成。</p>}</div></Drawer>;
-}
-
-function QualityDrawer({ visible, onClose, result, onFix }) {
-  const report = result?.qualityReport; const items = report ? [['事实检查', report.factCheck], ['来源隔离', report.sourceLeakCheck], ['平台结构', report.platformCheck], ['表达自然', report.aiStyleCheck], ['高风险表述', report.riskCheck]] : [];
-  const blocked = report?.status === 'blocked';
-  const visibleWarnings = [...new Set((report?.warnings || []).map(humanizeQualityIssue).filter(Boolean))];
-  return <Drawer title="文案检查" width={440} visible={visible} onCancel={onClose} footer={null}>{!report ? <p>生成文案后显示检查结果。</p> : <><div className="quality-summary"><span className={blocked ? 'fail' : visibleWarnings.length ? 'warn' : 'pass'}>{blocked || visibleWarnings.length ? <IconExclamationCircleFill /> : <IconCheckCircleFill />}</span><div><strong>{blocked ? '有内容需要确认' : visibleWarnings.length ? '还有可以优化的地方' : '检查通过'}</strong><small>正文 {report.bodyLength} 字 · 已按当前平台要求检查</small></div></div><div className="quality-grid">{items.map(([label, state]) => <div key={label}><span className={state}><IconCheck /></span><strong>{label}</strong><small>{state === 'pass' ? '通过' : state === 'warning' ? '建议确认' : '需要确认'}</small></div>)}</div>{visibleWarnings.length > 0 && <div className="warning-list"><h3>{blocked ? '请确认' : '优化建议'}</h3>{visibleWarnings.map((warning) => <div key={warning}><p><IconInfoCircleFill />{warning}</p><Button size="mini" onClick={() => onFix(warning)}>让 AI 调整</Button></div>)}</div>}</>}</Drawer>;
-}
-
-function humanizeQualityIssue(issue = '') {
-  if (/缺少必需字段：topics|topics 至少需要/.test(issue)) return '话题标签不足 3 个，系统会自动补齐，也可以直接调整';
-  if (/缺少必需字段：titleCandidates|titleCandidates 至少需要/.test(issue)) return '标题方案不足，系统会自动补充不同角度的标题';
-  if (/缺少必需字段：bodyMarkdown/.test(issue)) return '正文内容还没有生成完整';
-  return issue.replaceAll('topics', '话题标签').replaceAll('titleCandidates', '标题方案').replaceAll('bodyMarkdown', '正文');
-}
-
-function VersionsDrawer({ visible, onClose, content, current, onUse }) { const versions = content?.versions || (current ? [current] : []); return <Drawer title="版本记录" width={440} visible={visible} onCancel={onClose} footer={null}><div className="version-list">{versions.slice().reverse().map((version, index) => <div key={version.id || index}><span className="version-dot" /><div><strong>{version.titleCandidates?.[version.selectedTitleIndex || 0] || content?.name || '未命名文案'}</strong><small>{formatTime(version.createdAt)} · {version.reason || '保存'}</small><p>{version.bodyMarkdown?.slice(0, 100)}</p></div><Button size="small" onClick={() => onUse(version)}>使用</Button></div>)}</div></Drawer>; }
-
-function HistoryPage({ contents, onOpen, onNew, onDelete, onRename }) { return <section className="library-page"><div className="library-heading"><div><h1>内容记录</h1><p>查看保存的文案、版本和更新时间，继续编辑或重新使用。</p></div><Button type="primary" icon={<IconPlus />} onClick={onNew}>新建文案</Button></div>{contents.length ? <div className="library-list"><div className="library-list-head"><span>名称</span><span>平台</span><span>更新时间</span><span /></div>{contents.map((item) => <div className="library-row" key={item.id}><div className="library-name"><span className="library-icon"><IconFile /></span><span><strong>{item.name}</strong><small>{item.versionCount} 个版本 · {item.status === 'saved' ? '已保存' : item.status}</small></span></div><span>{platformOptions.find((option) => option.value === item.platform)?.label || item.platform}</span><span className="library-time">{formatTime(item.updatedAt)}</span><Space size={2}><Button type="text" onClick={() => onOpen(item.id)}>打开</Button><Tooltip content="重命名"><Button type="text" icon={<IconEdit />} aria-label="重命名" onClick={() => onRename(item)} /></Tooltip><Tooltip content="删除"><Button type="text" status="danger" icon={<IconDelete />} aria-label="删除" onClick={() => onDelete(item.id)} /></Tooltip></Space></div>)}</div> : <div className="empty-library"><IconFile /><strong>还没有保存的文案</strong><p>生成并保存文案后，会显示在这里。</p><Button type="primary" onClick={onNew}>开始创作</Button></div>}</section>; }
-
-function formatTime(value) { if (!value) return '刚刚'; const date = new Date(value); const diff = Date.now() - date.getTime(); if (diff < 60000) return '刚刚'; if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`; if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`; return `${date.getMonth() + 1} 月 ${date.getDate()} 日`; }
 
 createRoot(document.getElementById('root')).render(<React.StrictMode><App /></React.StrictMode>);

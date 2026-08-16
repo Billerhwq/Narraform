@@ -8,7 +8,7 @@ import { createTaskBrief, publicTaskBrief } from './task-understanding.js';
 import { createTextMaterial, fetchWebMaterial, parseUploadedFile, publicMaterial } from './materials.js';
 import { getPublicSpecs, normalizePlatform, resolvePlatformSpec } from './platform-specs.js';
 import { normalizeAndRepairResult, runQualityChecks } from './quality.js';
-import { deleteContent, getContent, getMaterials, getTask, listContents, renameContent, resetStore, saveContent, saveMaterial, saveTask, selectTaskStrategy } from './store.js';
+import { deleteContent, getContent, getContentVersions, getMaterials, getTask, listContents, renameContent, resetStore, restoreContentVersion, saveContent, saveMaterial, saveTask, selectTaskStrategy } from './store.js';
 import { executeContentOperation } from './operation-engine.js';
 import { getPublicOperationSpecs } from './operation-specs.js';
 import { hashContent } from './change-set.js';
@@ -148,7 +148,7 @@ function writeSse(response, event, payload) {
 
 app.post('/api/content-operations/stream', async (request, response) => {
   const controller = new AbortController();
-  const operationId = crypto.randomUUID();
+  const operationId = request.body.operationId || request.get('Idempotency-Key') || crypto.randomUUID();
   request.once('aborted', () => controller.abort());
   response.once('close', () => { if (!response.writableEnded) controller.abort(); });
   response.status(200).set({
@@ -159,7 +159,9 @@ app.post('/api/content-operations/stream', async (request, response) => {
   });
   response.flushHeaders();
   response.socket?.setNoDelay(true);
-  writeSse(response, 'started', { operation: request.body.operation, operationId });
+  const started = { operation: request.body.operation, operationId, attempt: 1 };
+  writeSse(response, 'started', started);
+  writeSse(response, 'operation.started', started);
   try {
     const output = await executeFromHttp({ ...request.body, operationId }, controller.signal);
     const field = output.changeSet.changedFields.includes('bodyMarkdown') ? 'bodyMarkdown'
@@ -168,16 +170,38 @@ app.post('/api/content-operations/stream', async (request, response) => {
     let index = 0;
     for (const character of value) {
       if (controller.signal.aborted) throw Object.assign(new Error('操作已取消'), { code: 'ABORTED', status: 499 });
-      writeSse(response, 'delta', { operationId: output.operationId, field, delta: character, index });
+      const delta = { operationId: output.operationId, field, delta: character, text: character, index };
+      writeSse(response, 'field.delta', delta);
+      writeSse(response, 'delta', delta);
       index += 1;
       await new Promise((resolve) => setTimeout(resolve, 12));
     }
-    writeSse(response, 'verifying', { operationId: output.operationId, checks: ['field_permissions', 'facts', 'platform', 'operation_quality'] });
+    const verification = { operationId: output.operationId, checks: ['field_permissions', 'facts', 'platform', 'operation_quality'] };
+    writeSse(response, 'verifying', verification);
+    writeSse(response, 'quality.completed', { operationId: output.operationId, qualityReport: output.result.qualityReport });
+    if (request.body.contentId) {
+      const selectedTitle = output.result.titleCandidates?.[output.result.selectedTitleIndex || 0];
+      const saved = await saveContent({
+        id: request.body.contentId,
+        baseRevision: request.body.baseRevision,
+        name: selectedTitle || '未命名文案',
+        platform: output.result.platform || request.body.platform,
+        materialIds: request.body.materialIds || [],
+        materialSetId: request.body.materialSetId || null,
+        ...output.result,
+        reason: request.body.operation,
+      });
+      output.savedContent = { id: saved.id, revision: saved.revision, updatedAt: saved.updatedAt };
+      writeSse(response, 'version.saved', { operationId: output.operationId, contentId: saved.id, revision: saved.revision, updatedAt: saved.updatedAt });
+    }
     writeSse(response, 'completed', output);
+    writeSse(response, 'operation.completed', output);
     response.end();
   } catch (error) {
     if (!response.writableEnded) {
-      writeSse(response, 'error', { code: error.code || 'OPERATION_FAILED', error: publicError(error) });
+      const failure = { code: error.code || 'OPERATION_FAILED', error: publicError(error), operationId };
+      writeSse(response, 'error', failure);
+      writeSse(response, 'operation.failed', failure);
       response.end();
     }
   }
@@ -242,8 +266,28 @@ app.post('/api/contents', async (request, response, next) => {
     response.status(201).json({ content: await saveContent(payload) });
   } catch (error) { next(error); }
 });
+app.get('/api/contents/:id/versions', async (request, response, next) => {
+  try {
+    const versions = await getContentVersions(request.params.id);
+    if (!versions) return response.status(404).json({ code: 'CONTENT_NOT_FOUND', error: '没有找到这条内容记录' });
+    response.json({ contentId: request.params.id, versions });
+  } catch (error) { next(error); }
+});
+app.post('/api/contents/:id/versions/:versionId/restore', async (request, response, next) => {
+  try {
+    const baseRevision = request.body.baseRevision ?? request.get('If-Match');
+    const content = await restoreContentVersion(request.params.id, request.params.versionId, baseRevision);
+    if (!content) return response.status(404).json({ code: 'CONTENT_NOT_FOUND', error: '没有找到这条内容记录' });
+    response.json({ content, version: content.versions.at(-1) });
+  } catch (error) { next(error); }
+});
 app.patch('/api/contents/:id', async (request, response, next) => {
   try {
+    if (request.body.bodyMarkdown !== undefined || request.body.titleCandidates !== undefined) {
+      const baseRevision = request.body.baseRevision ?? request.get('If-Match');
+      const content = await saveContent({ ...request.body, id: request.params.id, baseRevision });
+      return response.json({ content, version: content.versions.at(-1) });
+    }
     const content = await renameContent(request.params.id, request.body.name || '');
     if (!content) return response.status(404).json({ error: '没有找到这条内容记录' });
     response.json({ content });
@@ -259,7 +303,7 @@ app.delete('/api/contents/:id', async (request, response, next) => {
 if (process.env.NODE_ENV === 'test') app.post('/api/test/reset', async (_request, response) => { await resetStore(); response.status(204).end(); });
 
 function publicError(error) {
-  const known = new Set(['TASK_NOT_FOUND', 'CONTENT_STALE', 'INVALID_OPERATION', 'INVALID_SCOPE', 'ABORTED']);
+  const known = new Set(['TASK_NOT_FOUND', 'CONTENT_STALE', 'CONTENT_REVISION_CONFLICT', 'CONTENT_NOT_FOUND', 'VERSION_NOT_FOUND', 'INVALID_OPERATION', 'INVALID_SCOPE', 'ABORTED']);
   if (known.has(error.code)) return error.message;
   if (error.status && error.status < 500 && error.code !== 'NO_ACCEPTABLE_CHANGE') return error.message;
   if (error.code === 'NO_ACCEPTABLE_CHANGE') return '这次没有生成可用内容，原内容已保留';
