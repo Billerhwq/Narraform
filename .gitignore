@@ -1,0 +1,12 @@
+node_modules/
+dist/
+data/
+.test-data/
+screenshots/
+coverage/
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+.DS_Store
