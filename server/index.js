@@ -14,6 +14,8 @@ import { getPublicOperationSpecs } from './operation-specs.js';
 import { hashContent } from './change-set.js';
 import { getPublicXhsFormatting, normalizeXhsFormattingOverride, resolveXhsFormattingProfile } from './xhs-formatting.js';
 import { createMaterialSet, deleteMaterialItem, deleteMaterialSet, factSetFromMaterialSet, getMaterialAnalysisEvents, getMaterialAnalysisJob, getMaterialAsset, getMaterialSet, getMaterialSetInternal, queueMaterialSetItems, resolveMaterialConflicts, resumePendingMaterialAnalysisJobs, retryMaterialItem, updateMaterialFact } from './material-understanding.js';
+import { cancelDeliveryJob, createDeliveryJob, createPublishPackages, deleteDeliveryForContent, deleteDeliveryReceipt, getDeliveryJob, getDeliveryReceipt, getPlatformSession, getPublishPackage, listDeliveryJobs, listDeliveryReceipts, listPublishPackages, preflightPublishPackage, resumePendingDeliveryJobs, retryDeliveryJob, startPlatformLogin } from './publish-delivery.js';
+import { listRuntimeEvents } from './adapter-runtime.js';
 
 const app = express();
 const port = Number(process.env.CONTENTFLOW_API_PORT || 4176);
@@ -35,6 +37,10 @@ app.get('/api/health', async (_request, response, next) => {
 });
 
 app.get('/api/specs', (_request, response) => response.json({ specs: getPublicSpecs(), operationSpecs: getPublicOperationSpecs() }));
+
+app.get('/api/runtime-events', async (request, response, next) => {
+  try { response.json({ events: await listRuntimeEvents(request.query) }); } catch (error) { next(error); }
+});
 
 app.post('/api/materials/upload', upload.array('files', 10), async (request, response, next) => {
   try {
@@ -390,6 +396,75 @@ app.patch('/api/contents/:id', async (request, response, next) => {
 app.delete('/api/contents/:id', async (request, response, next) => {
   try {
     if (!(await deleteContent(request.params.id))) return response.status(404).json({ error: '没有找到这条内容记录' });
+    await deleteDeliveryForContent(request.params.id);
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+
+app.get('/api/publish-packages', async (_request, response, next) => {
+  try { response.json({ packages: await listPublishPackages() }); } catch (error) { next(error); }
+});
+app.post('/api/publish-packages', async (request, response, next) => {
+  try { response.status(201).json({ packages: await createPublishPackages(request.body) }); } catch (error) { next(error); }
+});
+app.get('/api/publish-packages/:id', async (request, response, next) => {
+  try {
+    const publishPackage = await getPublishPackage(request.params.id);
+    if (!publishPackage) return response.status(404).json({ code: 'PUBLISH_PACKAGE_NOT_FOUND', error: '没有找到发布包' });
+    response.json({ package: publishPackage });
+  } catch (error) { next(error); }
+});
+app.post('/api/publish-packages/:id/preflight', async (request, response, next) => {
+  try { response.json({ preflight: await preflightPublishPackage(request.params.id) }); } catch (error) { next(error); }
+});
+app.get('/api/delivery-jobs', async (_request, response, next) => {
+  try { response.json({ jobs: await listDeliveryJobs() }); } catch (error) { next(error); }
+});
+app.post('/api/delivery-jobs', async (request, response, next) => {
+  try { response.status(202).json({ job: await createDeliveryJob(request.body.packageIds || []) }); } catch (error) { next(error); }
+});
+app.get('/api/delivery-jobs/:id', async (request, response, next) => {
+  try {
+    const job = await getDeliveryJob(request.params.id);
+    if (!job) return response.status(404).json({ code: 'DELIVERY_JOB_NOT_FOUND', error: '没有找到发布任务' });
+    response.json({ job });
+  } catch (error) { next(error); }
+});
+app.get('/api/delivery-jobs/:id/events', async (request, response, next) => {
+  try {
+    const job = await getDeliveryJob(request.params.id);
+    if (!job) return response.status(404).json({ code: 'DELIVERY_JOB_NOT_FOUND', error: '没有找到发布任务' });
+    const after = Math.max(0, Number(request.query.after) || 0);
+    response.json({ jobId: job.jobId, status: job.status, events: job.events.slice(after), nextCursor: job.events.length });
+  } catch (error) { next(error); }
+});
+app.post('/api/delivery-jobs/:id/retry', async (request, response, next) => {
+  try { response.status(202).json({ job: await retryDeliveryJob(request.params.id) }); } catch (error) { next(error); }
+});
+app.post('/api/delivery-jobs/:id/cancel', async (request, response, next) => {
+  try { response.json({ job: await cancelDeliveryJob(request.params.id) }); } catch (error) { next(error); }
+});
+app.get('/api/platform-sessions/:platform', async (request, response, next) => {
+  try { response.json({ session: await getPlatformSession(request.params.platform) }); }
+  catch (error) { next(error); }
+});
+app.post('/api/platform-sessions/:platform/login', async (request, response, next) => {
+  try { response.status(202).json({ session: await startPlatformLogin(request.params.platform) }); }
+  catch (error) { next(error); }
+});
+app.get('/api/delivery-receipts', async (_request, response, next) => {
+  try { response.json({ receipts: await listDeliveryReceipts() }); } catch (error) { next(error); }
+});
+app.get('/api/delivery-receipts/:id', async (request, response, next) => {
+  try {
+    const receipt = await getDeliveryReceipt(request.params.id);
+    if (!receipt) return response.status(404).json({ code: 'DELIVERY_RECEIPT_NOT_FOUND', error: '没有找到送达回执' });
+    response.json({ receipt });
+  } catch (error) { next(error); }
+});
+app.delete('/api/delivery-receipts/:id', async (request, response, next) => {
+  try {
+    if (!(await deleteDeliveryReceipt(request.params.id))) return response.status(404).json({ code: 'DELIVERY_RECEIPT_NOT_FOUND', error: '没有找到送达回执' });
     response.status(204).end();
   } catch (error) { next(error); }
 });
@@ -425,7 +500,11 @@ app.use((error, request, response, _next) => {
 if (process.argv[1] && fileURLToPath(import.meta.url).toLowerCase() === process.argv[1].toLowerCase()) {
   detectCodexCli().then((codex) => console.log(`Codex CLI ${codex.status}${codex.version ? ` (${codex.version})` : ''}`));
   app.listen(port, '127.0.0.1', async () => {
-    const resumed = await resumePendingMaterialAnalysisJobs().catch((error) => { console.error('[Narraform material queue]', error); return 0; });
+    const [materialsResumed, deliveriesResumed] = await Promise.all([
+      resumePendingMaterialAnalysisJobs().catch((error) => { console.error('[Narraform material queue]', error); return 0; }),
+      resumePendingDeliveryJobs().catch((error) => { console.error('[Narraform delivery queue]', error); return 0; }),
+    ]);
+    const resumed = materialsResumed + deliveriesResumed;
     console.log(`Narraform API http://127.0.0.1:${port}${resumed ? ` · resumed ${resumed} background job(s)` : ''}`);
   });
 }

@@ -67,6 +67,17 @@ export async function runAdapterOperation({
     });
     return result;
   } catch (error) {
+    if (error?.code === 'DELIVERY_CANCELLED' || error?.code === 'ABORTED' || error?.name === 'AbortError') {
+      await record({
+        type: 'adapter.cancelled',
+        operationId,
+        adapterKey,
+        adapterVersion,
+        action,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      throw error;
+    }
     circuit.failures += 1;
     if (circuit.failures >= failureThreshold) circuit.openedAt = Date.now();
     await record({

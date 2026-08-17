@@ -718,7 +718,7 @@ function App() {
         activeOperation={activeOperation} operationProgress={operationProgress} streamPreview={streamPreview} cancelOperation={cancelOperation} lastOperation={lastOperation} undoLastOperation={undoLastOperation}
         openMaterials={() => setMaterialsOpen(true)} openQuality={async () => { await checkCurrentResult(); setQualityOpen(true); }} openVersions={() => { setVersionsOpen(true); }} contentId={contentId} checkResult={checkCurrentResult} applyExpressionMode={applyExpressionMode}
       /> : section === 'materials' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开素材理解</span></div>}><MaterialsWorkspace materialSetId={materialSetId} onMaterialSetChange={setMaterialSetId} onUseForCreation={(set) => { setMaterialSetId(set.materialSetId); setSection('create'); Message.success('创作时会使用这组已确认资料'); }} /></Suspense>
-        : section === 'publish' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开平台发布</span></div>}><PublishWorkspace materialSetId={materialSetId} /></Suspense>
+        : section === 'publish' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开平台发布</span></div>}><PublishWorkspace onCreateContent={() => setSection('create')} /></Suspense>
           : section === 'review' ? <Suspense fallback={<div className="roadmap-loading"><Spin /><span>正在打开内容复盘</span></div>}><ReviewWorkspace /></Suspense>
       : <HistoryPage contents={contents} onOpen={loadContent} onNew={startNew} onDelete={deleteRecord} onRename={renameRecord} platformOptions={platformOptions} />}
     </main>
