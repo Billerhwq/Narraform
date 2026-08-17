@@ -38,6 +38,26 @@ test('PR-03 发布包绑定不可变内容版本并执行平台 preflight', asyn
   assert.equal((await preflightPublishPackage(withoutImage)).status, 'blocked');
 });
 
+test('PR-03 小红书发布包确定性收口标题和话题硬限制', async () => {
+  const content = await saveContent({
+    name: '平台限制测试',
+    platform: 'xiaohongshu',
+    titleCandidates: ['独立开发者的编码助手：CodeLoop-2026'],
+    bodyMarkdown: 'CodeLoop 可以读取授权仓库、拆解任务、修改代码并运行项目测试。',
+    topics: ['#独立开发', 'AI编程', '编码助手', '效率工具', 'CodeLoop', '开发工具', 'Agent', '自动化', '重复标签', 'AI编程'],
+  });
+  const [pkg] = await createPublishPackages({
+    contentId: content.id,
+    platforms: ['xiaohongshu'],
+    assets: [{ assetId: 'cover', type: 'image', role: 'cover' }],
+  });
+
+  assert.equal([...pkg.fields.title].length <= 20, true);
+  assert.equal(pkg.fields.topics.length, 8);
+  assert.equal(pkg.fields.topics.some((topic) => topic.startsWith('#')), false);
+  assert.equal((await preflightPublishPackage(pkg)).status, 'pass');
+});
+
 test('PR-03 发布包默认只使用所选内容绑定的素材集', async () => {
   const firstSet = await createMaterialSet();
   const secondSet = await createMaterialSet();

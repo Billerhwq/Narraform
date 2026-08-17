@@ -20,10 +20,22 @@ function selectedTitle(version) {
   return version.titleCandidates?.[version.selectedTitleIndex || 0] || version.titleCandidates?.[0] || '';
 }
 
+function fitText(value, maxLength) {
+  const text = String(value || '').trim();
+  if ([...text].length <= maxLength) return text;
+  return [...text].slice(0, maxLength).join('').replace(/[：:，,、\-—·]+$/u, '').trim();
+}
+
+function fitTopics(topics, maxCount) {
+  return [...new Set((Array.isArray(topics) ? topics : [])
+    .map((topic) => String(topic || '').trim().replace(/^#+/, ''))
+    .filter(Boolean))].slice(0, maxCount);
+}
+
 function fieldsForPlatform(platform, version, override = {}) {
   const title = override.title ?? selectedTitle(version);
   const body = override.body ?? version.bodyMarkdown ?? '';
-  if (platform === 'xiaohongshu') return { title, body, topics: override.topics ?? version.topics ?? [] };
+  if (platform === 'xiaohongshu') return { title: fitText(title, 20), body, topics: fitTopics(override.topics ?? version.topics, 8) };
   if (platform === 'zhihu') {
     const mode = override.mode || version.platformMode || 'article';
     return mode === 'answer'
