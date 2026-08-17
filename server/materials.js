@@ -11,10 +11,22 @@ function normalizeText(text = '') {
   return text.replace(/\u0000/g, '').replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n\n').trim().slice(0, MAX_TEXT);
 }
 
+function paragraphSegments(text, extra = {}) {
+  let cursor = 0;
+  return text.split(/\n{2,}/).map((value, index) => {
+    const paragraph = value.trim();
+    const start = text.indexOf(paragraph, cursor);
+    cursor = Math.max(cursor, start + paragraph.length);
+    const heading = paragraph.match(/^#{1,6}\s+(.+)$/)?.[1]?.trim() || null;
+    return { text: paragraph, locator: { ...extra, paragraph: index + 1, start, end: start + paragraph.length, ...(heading ? { heading } : {}) } };
+  }).filter((segment) => segment.text);
+}
+
 export async function parseUploadedFile(file) {
   const extension = path.extname(file.originalname || '').toLowerCase();
   if (!ALLOWED_EXTENSIONS.has(extension)) throw new Error('仅支持 TXT、Markdown、PDF 和 DOCX 文件');
   let text = '';
+  let segments = [];
   if (extension === '.txt' || extension === '.md' || extension === '.markdown') {
     text = file.buffer.toString('utf8');
   } else if (extension === '.docx') {
@@ -25,6 +37,7 @@ export async function parseUploadedFile(file) {
     try {
       const result = await parser.getText();
       text = result.text;
+      segments = result.pages.flatMap((page) => paragraphSegments(normalizeText(page.text), { page: page.num }));
     } finally {
       await parser.destroy();
     }
@@ -38,6 +51,7 @@ export async function parseUploadedFile(file) {
     mimeType: file.mimetype || 'application/octet-stream',
     status: 'ready',
     text,
+    segments: segments.length ? segments : paragraphSegments(text),
     characterCount: [...text].length,
   };
 }
@@ -84,6 +98,6 @@ export function createTextMaterial(text, name = '粘贴的文字') {
 }
 
 export function publicMaterial(material) {
-  const { text, ...safe } = material;
+  const { text, segments, ...safe } = material;
   return { ...safe, excerpt: text.slice(0, 120) };
 }
